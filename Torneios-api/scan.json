@@ -1,0 +1,36 @@
+{
+  "project": "E:\\codes\\Torneios-api",
+  "mode": "api",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/"
+    },
+    {
+      "method": "GET",
+      "path": "/manifest.webmanifest"
+    },
+    {
+      "method": "GET",
+      "path": "/sw.js"
+    },
+    {
+      "method": "POST",
+      "path": "/"
+    }
+  ],
+  "tested_routes": [
+    {
+      "method": "GET",
+      "path": "/"
+    },
+    {
+      "method": "GET",
+      "path": "/manifest.webmanifest"
+    },
+    {
+      "method": "GET",
+      "path": "/sw.js"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "base_url": "http://127.0.0.1:8790",
+  "requests_per_agent": 1,
+  "timeout_seconds": 10,
+  "headers": {},
+  "scenarios": [
+    {
+      "method": "GET",
+      "path": "/api/health",
+      "expected_status": [200]
+    },
+    {
+      "method": "GET",
+      "path": "/api/yasmin/health",
+      "expected_status": [200]
+    }
+  ]
+}
