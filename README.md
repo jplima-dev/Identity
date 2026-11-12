@@ -8,11 +8,11 @@ Deixe **um único arquivo vazio** de modo na raiz do Identity: `agente.tes` ou `
 
 ### `agente`
 
-O scanner procura o mecanismo de conversa e os exemplos de capacidades no código. No Yasmin, ele lê `PEDIDOS` em `Agent/agente/treino_capacidades.py` e gera `perguntas_geradas.json` com perguntas de conversa e de funções de leitura, incluindo consultas de projeto, arquivos, notas e lembretes. Cada agente do Identity envia **uma pergunta extraída do projeto** ao processador real em `Agent/servicos/comandos_workspace.py`. A cada nova rodada, o teste que falhou permanece com o mesmo agente; cada teste aprovado é trocado por uma pergunta diferente. O Identity executa todas as rodadas definidas em `.rod`. Funções que alteram arquivos, aplicativos ou configurações ficam fora da execução automática.
+O scanner lê `PEDIDOS` em `Agent/agente/treino_capacidades.py` e gera `perguntas_geradas.json` para todas as capacidades, inclusive abrir aplicativos. Cada agente do Identity classifica uma pergunta usando os pesos de `Agent/modelos/capacidades_local.json.gz`, lidos diretamente em memória. **O Identity não envia essas perguntas ao endpoint de comandos da Yasmin nem executa ferramentas ou aplicativos.** O teste verifica se o modelo escolheu a capacidade esperada; não verifica a resposta nem o efeito da ferramenta. A cada nova rodada, o teste que falhou permanece com o mesmo agente; cada teste aprovado é trocado por uma pergunta diferente.
 
 Após os testes, o Identity usa os exemplos de conversa encontrados no projeto para treinar o classificador local de intenções do Yasmin. O treino mantém 1.000 exemplos, avalia o modelo e o publica em `Agent/modelos/intencoes_local.json`. Uma cópia anterior fica em `Identity/yasmin/modelo_anterior.json`; se o treino ou os testes automatizados falharem, ela é restaurada. **Reinicie o Yasmin para carregar o modelo publicado.** O modelo generativo usado para criar respostas é um componente separado e não é treinado por esse processo.
 
-O resultado fica em `Identity/yasmin/relatorio.md`, com o JSONL das respostas e os logs de treino e testes. Para outro agente, o scanner registra o mecanismo encontrado; um adaptador de entrada, resposta e treino precisa ser configurado para executar seus testes.
+O resultado fica em `Identity/yasmin/relatorio.md`, com o JSONL das classificações e os logs de treino e testes. Para outro agente, o scanner registra o mecanismo encontrado; um adaptador seguro de classificação e treino precisa ser configurado para executar seus testes.
 
 ### `api`
 

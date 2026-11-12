@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 from identity.agent_mode import generate_cases, run_agent_cases
 from identity.campaign import next_cases
 from identity.cli import agent_count, round_count, run_mode
+from identity.offline_model import OfflineCapabilityModel
 from identity.scanner import discover_api, discover_base_url
 
 
@@ -25,6 +27,10 @@ class CampaignTests(unittest.TestCase):
     def test_complex_questions_enter_first_round(self):
         cases = generate_cases({"HORA": ["que horas são"], "descrever_projeto": ["descreva o projeto"]})
         self.assertEqual([case["complexidade"] for case in cases[:2]], ["basica", "complexa"])
+
+    def test_open_application_question_is_only_a_local_classification_case(self):
+        cases = generate_cases({"abrir_aplicacao_ink": ["abra o Workspace"]})
+        self.assertEqual(cases[0]["rotulo"], "abrir_aplicacao_ink")
 
     def test_mode_agent_count_and_rounds_use_extensions(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -50,38 +56,35 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(discover_base_url(root), "http://127.0.0.1:8000")
 
     def test_failed_question_is_retried_and_success_is_replaced(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers["Content-Length"])
-                question = json.loads(self.rfile.read(length))["texto"]
-                answer = "Não consegui obter uma resposta do mecanismo de conversa agora." if question == "erro" else "Resposta válida"
-                data = json.dumps({"resposta": answer}).encode()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+        class Model:
+            def predict(self, text):
+                return ("erro" if text == "erro" else "conversa", 0.9)
 
-            def log_message(self, *_):
-                return
+        cases = [{"texto": text, "contem": "", "rotulo": "conversa", "complexidade": "basica"} for text in ("erro", "bom", "novo")]
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "run.jsonl"
+            first = asyncio.run(run_agent_cases(2, cases[:2], Model(), output))
+            updated, _, _ = next_cases(cases, cases[:2], first["outcomes"], 2)
+            second = asyncio.run(run_agent_cases(2, updated, Model(), output, round_number=2))
+            records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        ordered = sorted(records, key=lambda record: (record["rodada"], record["agent"]))
+        self.assertEqual([record["texto"] for record in ordered], ["erro", "bom", "erro", "novo"])
+        self.assertEqual([first["failed"], second["failed"]], [1, 1])
+        self.assertTrue(all(record["tipo_teste"] == "classificacao_local" for record in records))
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            cases = [{"texto": text, "contem": "", "rotulo": "conversa", "complexidade": "basica"} for text in ("erro", "bom", "novo")]
-            with tempfile.TemporaryDirectory() as folder:
-                output = Path(folder) / "run.jsonl"
-                first = asyncio.run(run_agent_cases(2, cases[:2], f"http://127.0.0.1:{server.server_port}/command", output, 2))
-                updated, _, _ = next_cases(cases, cases[:2], first["outcomes"], 2)
-                second = asyncio.run(run_agent_cases(2, updated, f"http://127.0.0.1:{server.server_port}/command", output, 2, round_number=2))
-                records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-            ordered = sorted(records, key=lambda record: (record["rodada"], record["agent"]))
-            self.assertEqual([record["texto"] for record in ordered], ["erro", "bom", "erro", "novo"])
-            self.assertEqual([first["failed"], second["failed"]], [1, 1])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
+    def test_offline_model_reads_weights_without_running_project_code(self):
+        data = {"versao": 1, "rotulos": ["CHAMADA_CURTA", "HORA", "abrir_aplicacao_ink"],
+                "exemplos": 2, "documentos": {"HORA": 1, "abrir_aplicacao_ink": 1},
+                "totais": {"HORA": 1, "abrir_aplicacao_ink": 1},
+                "contagens": {"CHAMADA_CURTA": {}, "HORA": {"u:horas": 1},
+                              "abrir_aplicacao_ink": {"u:abra": 1}}}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "modelo.gz"
+            with gzip.open(path, "wt", encoding="utf-8") as stream:
+                json.dump(data, stream)
+            model = OfflineCapabilityModel(path, data["rotulos"])
+            self.assertEqual(model.predict("abra")[0], "abrir_aplicacao_ink")
+            self.assertEqual(model.predict("horas")[0], "HORA")
 
     def test_api_mode_ignores_rod_and_runs_scanned_route(self):
         class Handler(BaseHTTPRequestHandler):

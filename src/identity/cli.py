@@ -24,6 +24,7 @@ from .agent_mode import (
     write_training_examples,
 )
 from .campaign import next_cases
+from .offline_model import OfflineCapabilityModel
 from .progress import ProgressDisplay
 from .project import ProjectConfig, parse_project, run_project, write_report
 from .scanner import discover_agent, discover_api, discover_base_url
@@ -301,11 +302,12 @@ def main() -> None:
         else:
             if config.project is None:
                 raise ConfigurationError("O modo agente requer project em identity.json.")
-            raw = json.loads((root / "identity.json").read_text(encoding="utf-8"))
-            agent_url = discovery["url"] if discovery else raw.get("agent_url")
-            parsed_url = urlsplit(agent_url) if isinstance(agent_url, str) else None
-            if not parsed_url or parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
-                raise ConfigurationError("Defina agent_url HTTP(S) em identity.json.")
+            if discovery is None:
+                raise ConfigurationError("O scanner não encontrou um modelo de capacidades do agente.")
+            capability_model = OfflineCapabilityModel(
+                project_path / "Agent" / "modelos" / "capacidades_local.json.gz",
+                list(discovery["examples"]),
+            )
             pool = generate_cases(discovery["examples"])
             (output_dir / "perguntas_geradas.json").write_text(json.dumps(pool, ensure_ascii=False, indent=2), encoding="utf-8")
             assignments = [pool[i % len(pool)] for i in range(count)]
@@ -313,8 +315,8 @@ def main() -> None:
             rounds = []
             for round_number in range(1, round_count(root) + 1):
                 totals = Counter(case["rotulo"] for case in assignments)
-                progress.set_stage(f"Respostas · rodada {round_number}", dict(totals))
-                current = asyncio.run(run_agent_cases(count, assignments, agent_url, output, config.timeout_seconds, progress, round_number))
+                progress.set_stage(f"Classificação local · rodada {round_number}", dict(totals))
+                current = asyncio.run(run_agent_cases(count, assignments, capability_model, output, progress, round_number))
                 rounds.append(current)
                 assignments, cursor, _ = next_cases(pool, assignments, current["outcomes"], cursor)
             result = {**rounds[-1], "rounds": [{"round": item["round"], "passed": item["passed"], "failed": item["failed"]} for item in rounds], "requests": count * len(rounds)}
@@ -332,7 +334,7 @@ def main() -> None:
     if mode == "api":
         print(f"Total: {result['requests']} | sucesso: {result['passed']} | falha: {result['failed']} | média: {result['average_ms']} ms")
     else:
-        print(f"Rodadas: {len(result['rounds'])} | respostas finais: {result['passed']}/{count} | treino: {project_result['training_exit_code']} | testes: {project_result['tests_exit_code']}")
+        print(f"Rodadas: {len(result['rounds'])} | classificações finais: {result['passed']}/{count} | treino: {project_result['training_exit_code']} | testes: {project_result['tests_exit_code']}")
     print(f"Relatório: {report}")
     if failed:
         sys.exit(1)
