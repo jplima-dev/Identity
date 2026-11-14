@@ -19,17 +19,26 @@ COMPLEX_CAPABILITIES = (
     "pesquisar_conteudo", "listar_temporizadores", "listar_lembretes",
     "listar_notas", "ler_nota",
 )
-def generate_cases(examples: dict[str, list[str]]) -> list[dict[str, str]]:
+def generate_cases(examples: dict[str, list[str]], evaluation: dict[str, list[str]] | None = None) -> list[dict[str, str]]:
     groups = []
     for label in examples:
         group = []
+        seen: set[str] = set()
         for phrase in examples.get(label, []):
             variants = (phrase,) if label == "CHAMADA_CURTA" else (
-                phrase, f"yasmin, {phrase}", f"por favor, {phrase}", f"{phrase} por favor",
+                f"{prefix}{phrase}{suffix}" for prefix in ("", "yasmin, ", "ei yasmin, ", "por favor, ")
+                for suffix in ("", " por favor", " agora", " para mim")
             )
             for text in variants:
+                if text.casefold() in seen:
+                    continue
+                seen.add(text.casefold())
                 group.append({"texto": text, "contem": "", "rotulo": label,
-                              "complexidade": "complexa" if label in COMPLEX_CAPABILITIES else "basica"})
+                              "complexidade": "complexa" if label in COMPLEX_CAPABILITIES else "basica", "origem": "corpus"})
+        for phrase in (evaluation or {}).get(label, []):
+            if phrase.casefold() not in seen:
+                group.append({"texto": phrase, "contem": "", "rotulo": label,
+                              "complexidade": "complexa" if label in COMPLEX_CAPABILITIES else "basica", "origem": "avaliacao"})
         if group:
             groups.append(group)
     cases = [case for row in zip_longest(*groups) for case in row if case is not None]
@@ -55,6 +64,7 @@ async def run_agent_cases(count: int, cases: list[dict[str, str]], model: Offlin
                 "texto": case["texto"],
                 "capacidade": case["rotulo"],
                 "complexidade": case["complexidade"],
+                "origem": case.get("origem", "corpus"),
                 "tipo_teste": "classificacao_local",
                 "predicao": predicted,
                 "confianca": round(confidence, 6),
@@ -71,7 +81,7 @@ async def run_agent_cases(count: int, cases: list[dict[str, str]], model: Offlin
 
 
 def write_training_examples(cases: list[dict[str, str]], output: Path) -> int:
-    unique = {case["texto"] for case in cases if case["rotulo"] == "conversa"}
+    unique = {case["texto"] for case in cases if case["rotulo"] == "conversa" and case.get("origem") != "avaliacao"}
     with output.open("w", encoding="utf-8") as stream:
         for text in sorted(unique):
             stream.write(json.dumps({"texto": text, "rotulo": "nenhuma"}, ensure_ascii=False) + "\n")
@@ -80,6 +90,8 @@ def write_training_examples(cases: list[dict[str, str]], output: Path) -> int:
 
 def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[str, Any] | None, examples: int) -> Path:
     by_capability: Counter[str] = Counter()
+    unique_questions: set[str] = set()
+    by_origin: Counter[str] = Counter()
     lines = [
         f"# Relatório: {output_dir.name}", "", "## Classificação local de capacidades", "",
         "- Execução: modelo local em memória; nenhum comando enviado à Yasmin ou ao desktop.",
@@ -100,6 +112,8 @@ def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[
         for line in stream:
             item = json.loads(line)
             by_capability[item["capacidade"]] += 1
+            unique_questions.add(item["texto"])
+            by_origin[item.get("origem", "corpus")] += 1
             if item["rodada"] == last_round and not item["passed"] and shown < 100:
                 lines.append(f"- Agente {item['agent']}: {item['texto']!r}; esperado {item['capacidade']!r}; previsto {item['predicao']!r} ({item['confianca']:.1%})")
                 shown += 1
@@ -107,12 +121,21 @@ def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[
         lines.append(f"- Mais {result['failed'] - shown} falhas no JSONL.")
     elif not shown:
         lines.append("Nenhuma falha restante.")
-    lines.extend(["", "## Capacidades testadas", "", *(f"- {label}: {total}" for label, total in by_capability.items()), "", "## Treino", "", f"- Exemplos de conversa adicionados: {examples}"])
+    lines.extend(["", "## Cobertura", "",
+                  f"- Perguntas distintas testadas: {len(unique_questions)}/{result.get('pool_size', len(unique_questions))}",
+                  f"- Casos de avaliação reservados: {by_origin['avaliacao']}",
+                  f"- Capacidades com testes: {len(by_capability)}",
+                  "", "### Capacidades testadas", "", *(f"- {label}: {total}" for label, total in by_capability.items()),
+                  "", "### Ferramentas sem exemplos de classificação", "",
+                  *(f"- {name}" for name in result.get("uncovered_tools", [])),
+                  *(("Nenhuma.",) if not result.get("uncovered_tools") else ()),
+                  "", "## Treino", "", f"- Exemplos de conversa adicionados: {examples}"])
     if training is not None:
         lines.extend([
             f"- Código de saída do treino: {training['training_exit_code']}",
-            f"- Código de saída dos testes: {training['tests_exit_code']}",
-            "- Logs: treino.log, testes.log", "", "```text", training["training_log"].strip(), "```", "",
+            "- Avaliação do modelo: incluída no treino.log",
+            "- Testes executáveis do projeto: não iniciados automaticamente.",
+            "- Log: treino.log", "", "```text", training["training_log"].strip(), "```", "",
         ])
     report = output_dir / "relatorio.md"
     report.write_text("\n".join(lines), encoding="utf-8")

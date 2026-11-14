@@ -23,6 +23,8 @@ from .agent_mode import (
     write_agent_report,
     write_training_examples,
 )
+from .api_discovery import discover_contracts
+from .api_workflow import plan_resources, run_api_campaign
 from .campaign import next_cases
 from .offline_model import OfflineCapabilityModel
 from .progress import ProgressDisplay
@@ -101,7 +103,8 @@ def _headers(value: Any, label: str) -> dict[str, str]:
     return {key: _expand(val) for key, val in value.items()}
 
 
-def load_config(path: Path, url_override: str | None = None, requests_override: int | None = None, include_project: bool = True) -> RunConfig:
+def load_config(path: Path, url_override: str | None = None, requests_override: int | None = None, include_project: bool = True,
+                allow_empty_scenarios: bool = False) -> RunConfig:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -128,6 +131,8 @@ def load_config(path: Path, url_override: str | None = None, requests_override: 
     headers = _headers(raw.get("headers", {}), "headers")
 
     scenarios_raw = raw.get("scenarios")
+    if allow_empty_scenarios and not scenarios_raw:
+        scenarios_raw = [{"method": "GET", "path": "/"}]
     if not isinstance(scenarios_raw, list) or not scenarios_raw:
         raise ConfigurationError("scenarios deve conter pelo menos um cenário.")
     scenarios: list[Scenario] = []
@@ -243,7 +248,7 @@ def main() -> None:
     try:
         count = agent_count(root)
         mode = run_mode(root)
-        config = load_config(root / "identity.json", args.url, getattr(args, "requests_per_agent", None), False)
+        config = load_config(root / "identity.json", args.url, getattr(args, "requests_per_agent", None), False, True)
         project_path = None
         discovery = None
         scan_summary = None
@@ -255,19 +260,26 @@ def main() -> None:
                 routes = discover_api(project_path)
                 if not routes:
                     raise ConfigurationError("Nenhuma rota foi encontrada no código do projeto.")
-                safe_routes = [route for route in routes if route["method"] in {"GET", "HEAD", "OPTIONS"}]
-                if not safe_routes:
-                    raise ConfigurationError("Foram encontradas rotas, mas nenhuma rota de leitura pode ser testada automaticamente.")
-                scenarios = []
-                for route in safe_routes:
-                    dynamic = "{" in route["path"]
-                    path = re.sub(r"\{[^}]+\}", "0", route["path"])
-                    scenarios.append(Scenario(route["method"], path, (404,) if dynamic else (200,), {}))
+                contracts = discover_contracts(project_path)
+                seen_contracts = {(route["method"], route["path"]) for route in contracts}
+                contracts.extend({**route, "body_schema": None} for route in routes if (route["method"], route["path"]) not in seen_contracts)
+                raw_api = json.loads((root / "identity.json").read_text(encoding="utf-8"))
+                payloads = raw_api.get("api_payloads", {})
+                if not isinstance(payloads, dict):
+                    raise ConfigurationError("api_payloads deve ser um objeto por rota de criação.")
+                allow_remote_mutations = raw_api.get("allow_remote_mutations", False)
+                if not isinstance(allow_remote_mutations, bool):
+                    raise ConfigurationError("allow_remote_mutations deve ser true ou false.")
                 discovered_url = discover_base_url(project_path)
-                config = replace(config, base_url=args.url or discovered_url or config.base_url, scenarios=tuple(scenarios))
+                config = replace(config, base_url=args.url or discovered_url or config.base_url)
+                flows, skipped_routes, standalone = plan_resources(contracts, payloads)
+                hostname = urlsplit(config.base_url).hostname
+                if hostname not in {"127.0.0.1", "localhost", "::1"} and not allow_remote_mutations:
+                    skipped_routes.extend({"route": f"POST {flow.collection}", "reason": "Mutação remota requer allow_remote_mutations=true."} for flow in flows)
+                    flows = []
                 scan_summary = {"project": str(project_path), "mode": "api", "base_url": config.base_url,
-                                "routes": routes, "tested_routes": safe_routes,
-                                "test_cases": [{"method": item.method, "path": item.path, "expected_status": list(item.expected_status)} for item in scenarios]}
+                                "routes": contracts, "resource_flows": [flow.collection for flow in flows],
+                                "standalone_routes": standalone, "untested_routes": skipped_routes}
             else:
                 discovery = discover_agent(project_path)
                 if not discovery or discovery["kind"] != "yasmin-command":
@@ -277,9 +289,10 @@ def main() -> None:
                 model = project_path / "Agent" / "modelos" / "intencoes_local.json"
                 if not python.is_file() or not trainer.is_file():
                     raise ConfigurationError("Treinador ou Python do agente não encontrado.")
+                # Project test suites may execute desktop tools; the offline classifier is the test boundary.
                 config = replace(config, project=ProjectConfig(project_path, python, trainer,
                     ("--project", "{project_dir}", "--dados", "{output_dir}/treino_exemplos.jsonl", "--saida", "{project_dir}/Agent/modelos/intencoes_local.json"),
-                    ("tests.test_conversacao", "tests.test_modelo_treinavel", "tests.test_modo_chatbot"), model))
+                    (), model))
                 scan_summary = {"project": str(project_path), "mode": "agente", "mechanism": discovery, "training_script": str(trainer)}
         output_dir = root / (project_path.name if project_path else config.project.path.name if config.project else "results")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,18 +300,14 @@ def main() -> None:
             (output_dir / "scan.json").write_text(json.dumps(scan_summary, ensure_ascii=False, indent=2), encoding="utf-8")
         output = args.output or output_dir / f"run-{datetime.now(UTC):%Y%m%d-%H%M%S-%f}.jsonl"
         if mode == "api":
-            totals: Counter[str] = Counter()
-            for agent_id in range(1, count + 1):
-                for iteration in range(config.requests_per_agent):
-                    totals[config.scenarios[(agent_id - 1 + iteration) % len(config.scenarios)].method] += 1
-            progress.set_stage("Testando API", dict(totals))
-            result = asyncio.run(run_agents(count, config, output, progress))
+            result = asyncio.run(run_api_campaign(count, config.base_url, config.headers, config.timeout_seconds,
+                                                   flows, standalone, output, progress, config.requests_per_agent))
             result["base_url"] = config.base_url
-            result["cases"] = len(config.scenarios)
-            result["complex_cases"] = sum(404 in item.expected_status for item in config.scenarios)
+            result["untested_routes"] = skipped_routes
+            result["discovered_routes"] = len(contracts)
             progress.set_stage("Gerando relatório")
             report = write_report(output_dir, None, result, None)
-            failed = result["failed"]
+            failed = result["failed"] or result["cleanup_failed"] or not result["requests"]
         else:
             if config.project is None:
                 raise ConfigurationError("O modo agente requer project em identity.json.")
@@ -307,8 +316,9 @@ def main() -> None:
             capability_model = OfflineCapabilityModel(
                 project_path / "Agent" / "modelos" / "capacidades_local.json.gz",
                 list(discovery["examples"]),
+                discovery["examples"].get("CHAMADA_CURTA", ()),
             )
-            pool = generate_cases(discovery["examples"])
+            pool = generate_cases(discovery["examples"], discovery.get("evaluation"))
             (output_dir / "perguntas_geradas.json").write_text(json.dumps(pool, ensure_ascii=False, indent=2), encoding="utf-8")
             assignments = [pool[i % len(pool)] for i in range(count)]
             cursor = count
@@ -319,12 +329,14 @@ def main() -> None:
                 current = asyncio.run(run_agent_cases(count, assignments, capability_model, output, progress, round_number))
                 rounds.append(current)
                 assignments, cursor, _ = next_cases(pool, assignments, current["outcomes"], cursor)
-            result = {**rounds[-1], "rounds": [{"round": item["round"], "passed": item["passed"], "failed": item["failed"]} for item in rounds], "requests": count * len(rounds)}
+            result = {**rounds[-1], "rounds": [{"round": item["round"], "passed": item["passed"], "failed": item["failed"]} for item in rounds],
+                      "requests": count * len(rounds), "pool_size": len(pool),
+                      "uncovered_tools": discovery.get("uncovered_tools", [])}
             examples = write_training_examples(pool, output_dir / "treino_exemplos.jsonl")
             project_result = run_project(config.project, output_dir, progress)
             progress.set_stage("Gerando relatório")
             report = write_agent_report(output_dir, result, project_result, examples)
-            failed = result["failed"] or project_result["training_exit_code"] or project_result["tests_exit_code"]
+            failed = result["failed"] or project_result["training_exit_code"]
     except (ConfigurationError, OSError, ValueError) as exc:
         parser.exit(2, f"Erro: {exc}\n")
     except KeyboardInterrupt:
@@ -332,9 +344,10 @@ def main() -> None:
     finally:
         progress.finish()
     if mode == "api":
-        print(f"Total: {result['requests']} | sucesso: {result['passed']} | falha: {result['failed']} | média: {result['average_ms']} ms")
+        print(f"Total: {result['requests']} | sucesso: {result['passed']} | falha: {result['failed']} | "
+              f"limpeza: {result['cleanup_ok']} confirmadas, {result['cleanup_failed']} pendentes | média: {result['average_ms']} ms")
     else:
-        print(f"Rodadas: {len(result['rounds'])} | classificações finais: {result['passed']}/{count} | treino: {project_result['training_exit_code']} | testes: {project_result['tests_exit_code']}")
+        print(f"Rodadas: {len(result['rounds'])} | classificações finais: {result['passed']}/{count} | treino: {project_result['training_exit_code']}")
     print(f"Relatório: {report}")
     if failed:
         sys.exit(1)

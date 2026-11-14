@@ -7,8 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-EXCLUDED = {".git", ".venv", "node_modules", "backups", "tests", "Identity", "__pycache__"}
-DECORATOR = re.compile(r"@(?:\w+\.)?(get|post|put|patch|delete|head|options)\(\s*['\"]([^'\"]+)['\"]")
+from .api_discovery import discover_contracts
+
+EXCLUDED = {".git", ".venv", "node_modules", "backups", "tests", "Identity", "__pycache__", "dist", "build", ".next", "vendor"}
 GET_ROUTE = re.compile(r"(?:parsed\.)?path\s*==\s*['\"](/api/[^'\"]+)['\"]")
 LOCAL_URL = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 
@@ -22,33 +23,13 @@ def source_files(project: Path) -> list[Path]:
 
 
 def discover_api(project: Path) -> list[dict[str, str]]:
-    found: set[tuple[str, str, str]] = set()
+    found = {(route["method"], route["path"], route["source"]) for route in discover_contracts(project)}
     for file in source_files(project):
+        if file.name != "server.py":
+            continue
         content = file.read_text(encoding="utf-8", errors="replace")
         source = str(file.relative_to(project))
-        prefix = ""
-        if file.suffix == ".py":
-            try:
-                tree = ast.parse(content)
-            except SyntaxError:
-                tree = None
-            if tree:
-                for node in tree.body:
-                    if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                        value = node.value
-                        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "APIRouter":
-                            prefix = next((arg.value.value for arg in value.keywords if arg.arg == "prefix" and isinstance(arg.value, ast.Constant) and isinstance(arg.value.value, str)), "")
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        for decorator in node.decorator_list:
-                            if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute) and decorator.func.attr.lower() in {"get", "post", "put", "patch", "delete", "head", "options"} and decorator.args and isinstance(decorator.args[0], ast.Constant) and isinstance(decorator.args[0].value, str):
-                                route = decorator.args[0].value
-                                if route.startswith("/"):
-                                    found.add((decorator.func.attr.upper(), prefix.rstrip("/") + route, source))
-        for method, route in DECORATOR.findall(content):
-            if file.suffix != ".py" and route.startswith("/"):
-                found.add((method.upper(), route, source))
-        if file.name == "server.py" and "def do_GET" in content:
+        if "def do_GET" in content:
             get_block = content.split("def do_GET", 1)[1].split("def do_POST", 1)[0]
             for route in GET_ROUTE.findall(get_block):
                 found.add(("GET", route, source))
@@ -69,6 +50,8 @@ def discover_base_url(project: Path) -> str | None:
 def discover_agent(project: Path) -> dict[str, Any] | None:
     capabilities = []
     examples: dict[str, list[str]] = {}
+    evaluation: dict[str, list[str]] = {}
+    registered_tools: dict[str, dict[str, str]] = {}
     corpus = project / "Agent" / "agente" / "treino_capacidades.py"
     if corpus.is_file():
         tree = ast.parse(corpus.read_text(encoding="utf-8", errors="replace"))
@@ -80,12 +63,38 @@ def discover_agent(project: Path) -> dict[str, Any] | None:
                         if isinstance(phrases, tuple) and all(isinstance(phrase, str) for phrase in phrases):
                             examples[key.value] = list(phrases)
                 capabilities = list(examples)
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "AVALIACAO" for target in node.targets):
+                try:
+                    pairs = ast.literal_eval(node.value)
+                except (ValueError, SyntaxError):
+                    pairs = ()
+                if isinstance(pairs, (list, tuple)):
+                    for pair in pairs:
+                        if (isinstance(pair, (list, tuple)) and len(pair) == 2
+                                and isinstance(pair[0], str) and isinstance(pair[1], str) and pair[1] in examples):
+                            evaluation.setdefault(pair[1], []).append(pair[0])
+    for file in source_files(project):
+        if file.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(file.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Ferramenta"
+                    and len(node.args) >= 2 and all(isinstance(arg, ast.Constant) and isinstance(arg.value, str) for arg in node.args[:2])):
+                name = node.args[0].value
+                registered_tools[name] = {"name": name, "description": node.args[1].value,
+                                          "source": str(file.relative_to(project))}
     bridge = project / "Agent" / "servicos" / "comandos_workspace.py"
     if bridge.is_file():
         content = bridge.read_text(encoding="utf-8", errors="replace")
         port = re.search(r"^PORTA\s*=\s*(\d+)", content, re.MULTILINE)
         if port and 'self.path != "/command"' in content:
-            return {"url": f"http://127.0.0.1:{port.group(1)}/command", "kind": "yasmin-command", "source": str(bridge.relative_to(project)), "capabilities": capabilities, "examples": examples}
+            return {"url": f"http://127.0.0.1:{port.group(1)}/command", "kind": "yasmin-command", "source": str(bridge.relative_to(project)),
+                    "capabilities": capabilities, "examples": examples, "evaluation": evaluation,
+                    "registered_tools": sorted(registered_tools.values(), key=lambda item: item["name"]),
+                    "uncovered_tools": sorted(set(registered_tools) - set(examples))}
     for file in source_files(project):
         content = file.read_text(encoding="utf-8", errors="replace")
         if "def responder(" in content or "def processar_comando(" in content:

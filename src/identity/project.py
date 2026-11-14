@@ -107,10 +107,13 @@ def run_project(config: ProjectConfig, output_dir: Path, progress: ProgressDispl
 def write_report(output_dir: Path, project: ProjectConfig | None, api: dict[str, Any], project_result: dict[str, Any] | None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     api_errors: Counter[str] = Counter()
+    blocked: Counter[str] = Counter()
     with Path(api["output"]).open(encoding="utf-8") as records:
         for line in records:
             item = json.loads(line)
-            if not item["passed"]:
+            if item.get("skipped"):
+                blocked[f"{item['method']} {item['path']}: {item.get('error') or 'etapa ignorada'}"] += 1
+            elif not item["passed"]:
                 api_errors[f"{item['method']} {item['path']}: {item['error'] or 'HTTP ' + str(item['status'])}"] += 1
     lines = [
         f"# Relatório: {output_dir.name}",
@@ -119,10 +122,14 @@ def write_report(output_dir: Path, project: ProjectConfig | None, api: dict[str,
         "",
         f"- Agentes: {api['agents']}",
         f"- URL base: {api.get('base_url', 'não informada')}",
-        f"- Cenários: {api.get('cases', 'não informado')} (com parâmetros: {api.get('complex_cases', 'não informado')})",
+        f"- Endpoints descobertos: {api.get('discovered_routes', 'não informado')}",
+        f"- Cenários: {api.get('cases', 'não informado')} (fluxos CRUD: {api.get('complex_cases', 'não informado')})",
         f"- Requisições: {api['requests']}",
         f"- Sucessos: {api['passed']}",
         f"- Falhas: {api['failed']}",
+        f"- Etapas não executadas: {api.get('skipped', 0)}",
+        f"- Recursos excluídos ao final: {api.get('cleanup_ok', 0)}",
+        f"- Limpezas não confirmadas: {api.get('cleanup_failed', 0)}",
         f"- Latência média: {api['average_ms']} ms",
         f"- Dados: {Path(api['output']).name}",
         "",
@@ -130,6 +137,16 @@ def write_report(output_dir: Path, project: ProjectConfig | None, api: dict[str,
         "",
         *(f"- {reason}: {count}" for reason, count in api_errors.items()),
         *(("Nenhuma falha.",) if not api_errors else ()),
+        "",
+        "### Etapas bloqueadas",
+        "",
+        *(f"- {reason}: {count}" for reason, count in blocked.items()),
+        *(("Nenhuma.",) if not blocked else ()),
+        "",
+        "### Rotas descobertas sem execução automática",
+        "",
+        *(f"- {item['route']}: {item['reason']}" for item in api.get("untested_routes", [])),
+        *(("Nenhuma.",) if not api.get("untested_routes") else ()),
         "",
     ]
     if project is not None and project_result is not None:

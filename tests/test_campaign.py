@@ -14,9 +14,17 @@ from identity.campaign import next_cases
 from identity.cli import agent_count, round_count, run_mode
 from identity.offline_model import OfflineCapabilityModel
 from identity.scanner import discover_api, discover_base_url
+from identity.train_yasmin import combine_examples
 
 
 class CampaignTests(unittest.TestCase):
+    def test_conversation_examples_replace_only_remaining_base_slots(self):
+        base = [("a", "nenhuma"), ("b", "nenhuma"), ("c", "preparar_programacao")]
+        extras = [("a", "nenhuma"), ("d", "nenhuma")]
+        combined = combine_examples(base, extras)
+        self.assertEqual(len(combined), len(base))
+        self.assertEqual({text for text, _ in combined}, {"a", "c", "d"})
+
     def test_failed_case_stays_and_success_uses_new_case(self):
         pool = ["a", "b", "c", "d"]
         updated, cursor, changed = next_cases(pool, ["a", "b"], [False, True], 2)
@@ -85,6 +93,11 @@ class CampaignTests(unittest.TestCase):
             model = OfflineCapabilityModel(path, data["rotulos"])
             self.assertEqual(model.predict("abra")[0], "abrir_aplicacao_ink")
             self.assertEqual(model.predict("horas")[0], "HORA")
+            with_calls = OfflineCapabilityModel(path, data["rotulos"], ["yasmin me escuta"])
+            self.assertEqual(with_calls.predict("yasmin me escuta"), ("CHAMADA_CURTA", 1.0))
+            self.assertEqual(with_calls.predict("Yasmin, você me escuta?"), ("CHAMADA_CURTA", 1.0))
+            self.assertNotEqual(with_calls.predict("yasmin me lembre de algo")[0], "CHAMADA_CURTA")
+            self.assertNotEqual(with_calls.predict("yasmin me escuta e crie um lembrete")[0], "CHAMADA_CURTA")
 
     def test_api_mode_ignores_rod_and_runs_scanned_route(self):
         class Handler(BaseHTTPRequestHandler):
