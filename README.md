@@ -1,2 +1,14 @@
-# Identity
-uma api que simula "pessoas" virtuais capazes de testar a sua aplicação
+
+
+O Identity analisa o código de um projeto, descobre o que pode testar e executa casos em paralelo. No modo `api`, verifica rotas HTTP e fluxos de criação, consulta, atualização e exclusão. No modo `agente`, gera variações de perguntas, verifica a capacidade escolhida pelo modelo e, na integração disponível com a Yasmin, treina um classificador local de intenções. Os resultados ficam em relatórios separados por projeto e por modo.
+O Identity analisa o código de um projeto, descobre o que pode testar e executa casos em paralelo. No modo `api`, verifica rotas HTTP e fluxos de criação, consulta, atualização e exclusão. No modo `agente`, identifica capacidades e mecanismos de resposta; quando há um adaptador compatível, gera variações de perguntas, testa a classificação e treina o modelo local. Os resultados ficam em relatórios separados por projeto e por modo.
+
+
+No caso da Yasmin, o scanner lê `PEDIDOS` e `AVALIACAO` em `Agent/agente/treino_capacidades.py` e inventaria as ferramentas registradas com `Ferramenta(...)`. Ele cria variações de perguntas e aponta ferramentas sem exemplos. Cada agente do Identity classifica uma pergunta com os pesos de `Agent/modelos/capacidades_local.json.gz`, lidos em memória. Perguntas reservadas para avaliação não entram nos exemplos de treino. Em cada rodada, perguntas que falharam permanecem; as que passaram são trocadas por outras.
+O scanner procura exemplos de capacidades, perguntas de avaliação, ferramentas registradas e o mecanismo de resposta no código do projeto. Quando encontra um formato com adaptador executável, cria variações das perguntas e distribui os testes entre os agentes do Identity. Em cada rodada, perguntas que falharam permanecem; as que passaram são trocadas por outras. O relatório aponta capacidades e ferramentas sem exemplos.
+
+**O Identity não envia essas perguntas ao endpoint de comandos da Yasmin nem abre aplicativos.** A classificação verifica a capacidade escolhida, sem executar a ferramenta nem avaliar sua resposta. Depois, exemplos de conversa encontrados no projeto treinam o classificador local de intenções, publicado em `Agent/modelos/intencoes_local.json`. Uma cópia anterior é restaurada se o treino falhar. Reinicie a Yasmin para carregar o modelo publicado. O modelo generativo de respostas não é treinado por esse processo.
+Os testes de classificação usam o modelo local sem enviar comandos capazes de acionar ferramentas ou abrir aplicativos. Eles verificam a capacidade escolhida, sem avaliar a resposta final nem o efeito da ferramenta. Quando o adaptador oferece treino, exemplos de conversa alimentam o modelo local e o relatório registra o resultado. O treino de um modelo generativo de respostas não faz parte desse fluxo.
+
+Para outros agentes, o scanner pode registrar o mecanismo encontrado, mas a execução requer um adaptador seguro de classificação e treino.
+**A execução de testes e treino em agentes depende de um adaptador compatível.** Se o scanner reconhecer um mecanismo sem adaptador executável, o Identity informa essa limitação em vez de iniciar testes inseguros.
