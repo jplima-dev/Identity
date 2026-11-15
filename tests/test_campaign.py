@@ -1,6 +1,7 @@
 import asyncio
 import gzip
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -43,12 +44,60 @@ class CampaignTests(unittest.TestCase):
     def test_mode_agent_count_and_rounds_use_extensions(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            (root / "100.ag").touch()
-            (root / "agente.tes").touch()
-            (root / "10.rod").touch()
+            config = root / "config"
+            config.mkdir()
+            (config / "100.ag").touch()
+            (config / "agente.tes").touch()
+            (config / "10.rod").touch()
             self.assertEqual(agent_count(root), 100)
             self.assertEqual(run_mode(root), "agente")
             self.assertEqual(round_count(root), 10)
+
+    def test_inspection_commands_do_not_create_results(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            (project / "service.py").write_text('app = None\n@app.get("/health")\ndef health(): pass\n', encoding="utf-8")
+            identity = project / "Identity"
+            identity.mkdir()
+            config = identity / "config"
+            config.mkdir()
+            (config / "3.ag").touch()
+            (config / "4.rod").touch()
+            (config / "api.tes").touch()
+            (identity / "identity.json").write_text('{"base_url":"http://127.0.0.1:9999"}', encoding="utf-8")
+            for command, expected in (("tes", "api.tes"), ("rod", "4.rod"), ("ag", "3.ag"),
+                                      ("plan", "LER   GET /health")):
+                result = subprocess.run([sys.executable, "-m", "identity", command], cwd=identity,
+                                        text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expected, result.stdout)
+            self.assertFalse((identity / project.name).exists())
+            selected = subprocess.run([sys.executable, "-m", "identity", "plan", "--project", str(project)],
+                                      cwd=identity, text=True, capture_output=True, check=False, timeout=15)
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            self.assertIn("LER   GET /health", selected.stdout)
+            report_dir = identity / project.name
+            report_dir.mkdir()
+            (report_dir / "relatorio-api.md").write_text("# Relatório\n\nTeste local.", encoding="utf-8")
+            shown = subprocess.run([sys.executable, "-m", "identity", "report", project.name],
+                                   cwd=identity, text=True, capture_output=True, check=False, timeout=15)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertIn("Teste local.", shown.stdout)
+            agent_report = report_dir / "relatorio-agente.md"
+            agent_report.write_text("# Relatorio de agente\n\nSegundo relatorio.", encoding="utf-8")
+            future = (report_dir / "relatorio-api.md").stat().st_mtime + 10
+            os.utime(agent_report, (future, future))
+            for arguments in (("report", project.name), ("report",)):
+                newest = subprocess.run([sys.executable, "-m", "identity", *arguments], cwd=identity,
+                                        text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(newest.returncode, 0, newest.stderr)
+                self.assertIn("Segundo relatorio.", newest.stdout)
+            for kind, value, expected in (("ag", "7", "7.ag"), ("rod", "9", "9.rod"), ("tes", "agente", "agente.tes")):
+                updated = subprocess.run([sys.executable, "-m", "identity", kind, "set", value], cwd=identity,
+                                         text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(updated.returncode, 0, updated.stderr)
+                self.assertTrue((config / expected).is_file())
+            self.assertEqual(sorted(path.name for path in config.iterdir()), ["7.ag", "9.rod", "agente.tes"])
 
     def test_nested_router_and_local_url_are_discovered(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -100,8 +149,11 @@ class CampaignTests(unittest.TestCase):
             self.assertNotEqual(with_calls.predict("yasmin me escuta e crie um lembrete")[0], "CHAMADA_CURTA")
 
     def test_api_mode_ignores_rod_and_runs_scanned_route(self):
+        hits = []
+
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                hits.append(self.path)
                 self.send_response(200)
                 self.end_headers()
 
@@ -117,18 +169,59 @@ class CampaignTests(unittest.TestCase):
                 (project / "service.py").write_text('app = None\n@app.get("/health")\ndef health(): pass\n', encoding="utf-8")
                 identity = project / "Identity"
                 identity.mkdir()
-                (identity / "3.ag").touch()
-                (identity / "api.tes").touch()
-                (identity / "10.rod").touch()
+                config = identity / "config"
+                config.mkdir()
+                (config / "3.ag").touch()
+                (config / "api.tes").touch()
+                (config / "10.rod").touch()
                 (identity / "identity.json").write_text(json.dumps({
                     "base_url": f"http://127.0.0.1:{server.server_port}",
                     "scenarios": [{"path": "/health"}],
                 }), encoding="utf-8")
-                completed = subprocess.run([sys.executable, "-m", "identity", "scam"], cwd=identity,
+                scan = subprocess.run([sys.executable, "-m", "identity", "scam"], cwd=identity,
+                                      text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(scan.returncode, 0, scan.stderr + scan.stdout)
+                self.assertIn(f"identity {project.name}", scan.stdout)
+                saved_scan = identity / project.name / "scan.json"
+                saved_data = json.loads(saved_scan.read_text(encoding="utf-8"))
+                saved_data["mode"] = "agente"
+                saved_scan.write_text(json.dumps(saved_data), encoding="utf-8")
+                self.assertFalse(list((identity / project.name).glob("run-*.jsonl")))
+                self.assertEqual(hits, [])
+                help_result = subprocess.run([sys.executable, "-m", "identity", "--help"], cwd=identity,
+                                             text=True, capture_output=True, check=False, timeout=15)
+                self.assertIn(project.name, help_result.stdout)
+                self.assertNotIn("{run,", help_result.stdout)
+                welcome = subprocess.run([sys.executable, "-m", "identity"], cwd=identity,
+                                         text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(welcome.returncode, 0, welcome.stderr)
+                self.assertIn("IDENTITY  /  COMANDOS", welcome.stdout)
+                self.assertIn("PROJETOS SALVOS", welcome.stdout)
+                (config / "10.rod").unlink()
+                missing_rounds = subprocess.run([sys.executable, "-m", "identity", project.name], cwd=project,
+                                                text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(missing_rounds.returncode, 2)
+                self.assertIn(".rod", missing_rounds.stderr)
+                self.assertEqual(hits, [])
+                (config / "10.rod").touch()
+                completed = subprocess.run([sys.executable, "-m", "identity", project.name], cwd=project,
                                            text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-                report = (identity / project.name / "relatorio.md").read_text(encoding="utf-8")
+                self.assertIn("SCANNER  /  API", completed.stdout)
+                self.assertIn("RESULTADO  /  API", completed.stdout)
+                self.assertEqual(hits, ["/health"] * 3)
+                self.assertEqual(json.loads(saved_scan.read_text(encoding="utf-8"))["mode"], "api")
+                report = (identity / project.name / "relatorio-api.md").read_text(encoding="utf-8")
                 self.assertIn("Requisições: 3", report)
+                (config / "3.ag").unlink()
+                (config / "2.ag").touch()
+                (config / "10.rod").unlink()
+                (config / "5.rod").touch()
+                rerun = subprocess.run([sys.executable, "-m", "identity", project.name], cwd=project,
+                                       text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(rerun.returncode, 0, rerun.stderr + rerun.stdout)
+                self.assertEqual(hits, ["/health"] * 5)
+                self.assertIn("Requisições: 2", (identity / project.name / "relatorio-api.md").read_text(encoding="utf-8"))
         finally:
             server.shutdown()
             server.server_close()

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from identity.cli import RunConfig, Scenario, run_agents
 from identity.progress import ProgressDisplay
+from identity.terminal_ui import panel
 
 
 class Terminal(io.StringIO):
@@ -16,6 +17,44 @@ class Terminal(io.StringIO):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_intro_uses_one_green_line_and_skips_captured_output(self):
+        stream = Terminal()
+        progress = ProgressDisplay(stream)
+        progress.vt = True
+        progress.show_intro(delay=0, show_tagline=True)
+        rendered = stream.getvalue()
+        self.assertEqual(rendered.count("\x1b[2K"), len("IDENTITY"))
+        self.assertIn("\x1b[1;92m  I D E N T I T Y\x1b[0m", rendered)
+        self.assertIn("\x1b[32m  SCAN  /  TEST  /  REPORT\x1b[0m", rendered)
+        command_stream = Terminal()
+        command_intro = ProgressDisplay(command_stream)
+        command_intro.vt = True
+        command_intro.show_intro(delay=0)
+        self.assertIn("I D E N T I T Y", command_stream.getvalue())
+        self.assertNotIn("SCAN  /  TEST  /  REPORT", command_stream.getvalue())
+        captured = io.StringIO()
+        ProgressDisplay(captured).show_intro(delay=0)
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_panels_fit_width_and_do_not_leave_old_bars(self):
+        rendered = panel("IDENTITY / SCANNER", [("Projeto", "E:/codes/um-projeto-com-nome-bem-grande")], width=50)
+        self.assertTrue(all(len(line) <= 50 for line in rendered.splitlines()))
+        self.assertNotIn("+----", rendered)
+        narrow = panel("IDENTITY", [("Arquivo", "agente.tes")], width=20)
+        self.assertTrue(all(len(line) <= 20 for line in narrow.splitlines()))
+        tiny = panel("IDENTITY", [("Arquivo", "agente.tes")], width=4)
+        self.assertTrue(all(len(line) <= 4 for line in tiny.splitlines()))
+        stream = Terminal()
+        progress = ProgressDisplay(stream)
+        progress.interactive = True
+        progress.vt = True
+        progress.set_stage("Escaneando", {"GET": 1})
+        progress._render()
+        progress.show_panel("SCANNER / API", [("Rotas", "5")])
+        progress._render()
+        self.assertIn("SCANNER / API", stream.getvalue())
+        self.assertIn("Rotas", stream.getvalue())
+
     def test_bars_follow_completed_results_by_type(self):
         stream = Terminal()
         progress = ProgressDisplay(stream)

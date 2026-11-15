@@ -175,6 +175,6 @@ def write_report(output_dir: Path, project: ProjectConfig | None, api: dict[str,
             failures = [line for line in log.splitlines() if "Error" in line or "Erro" in line or "FAIL" in line or "Traceback" in line]
             lines.extend([f"### {title}", "", *(f"- {line}" for line in failures[:30])] if failures else [f"### {title}", "", "Nenhum erro identificado no log."])
             lines.append("")
-    report = output_dir / "relatorio.md"
+    report = output_dir / "relatorio-api.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return report

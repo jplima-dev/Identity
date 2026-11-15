@@ -137,6 +137,6 @@ def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[
             "- Testes executáveis do projeto: não iniciados automaticamente.",
             "- Log: treino.log", "", "```text", training["training_log"].strip(), "```", "",
         ])
-    report = output_dir / "relatorio.md"
+    report = output_dir / "relatorio-agente.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return report

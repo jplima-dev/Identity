@@ -158,14 +158,20 @@ class ApiWorkflowTests(unittest.TestCase):
                 events = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
                 identity = root / "Identity"
                 identity.mkdir()
-                (identity / "2.ag").touch()
-                (identity / "api.tes").touch()
+                config = identity / "config"
+                config.mkdir()
+                (config / "2.ag").touch()
+                (config / "api.tes").touch()
+                (config / "10.rod").touch()
                 (identity / "identity.json").write_text(json.dumps({"base_url": f"http://127.0.0.1:{server.server_port}"}),
                                                         encoding="utf-8")
-                completed = subprocess.run([sys.executable, "-m", "identity", "scam"], cwd=identity,
+                scan = subprocess.run([sys.executable, "-m", "identity", "scam"], cwd=identity,
+                                      text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(scan.returncode, 0, scan.stderr + scan.stdout)
+                completed = subprocess.run([sys.executable, "-m", "identity", root.name], cwd=identity,
                                            text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(completed.returncode, 1, completed.stderr + completed.stdout)
-                report = (identity / root.name / "relatorio.md").read_text(encoding="utf-8")
+                report = (identity / root.name / "relatorio-api.md").read_text(encoding="utf-8")
                 self.assertIn("Recursos excluídos ao final: 2", report)
             self.assertEqual(result["cleanup_ok"], 3)
             self.assertEqual(result["cleanup_failed"], 0)

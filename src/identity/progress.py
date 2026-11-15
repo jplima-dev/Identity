@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import threading
 import time
 from collections import Counter
 from typing import Self, TextIO
+
+from .terminal_ui import panel
 
 
 def _enable_windows_vt() -> bool:
@@ -27,7 +30,7 @@ def _enable_windows_vt() -> bool:
 
 
 class ProgressDisplay:
-    def __init__(self, stream: TextIO | None = None, interval: float = 0.5) -> None:
+    def __init__(self, stream: TextIO | None = None, interval: float = 0.2) -> None:
         self.stream = stream or sys.stdout
         self.interval = interval
         self.interactive = self.stream.isatty()
@@ -47,8 +50,32 @@ class ProgressDisplay:
     def __enter__(self) -> Self:
         return self.start()
 
+    def show_intro(self, delay: float = 0.018, show_tagline: bool = False) -> None:
+        """Reveal the brand once on a real terminal, without polluting captured output."""
+        if not self.interactive:
+            return
+        if not self.vt:
+            self.stream.write("IDENTITY\n")
+            if show_tagline:
+                self.stream.write("SCAN  /  TEST  /  REPORT\n")
+            self.stream.write("\n")
+            self.stream.flush()
+            return
+        for length in range(1, len("IDENTITY") + 1):
+            title = " ".join("IDENTITY"[:length])
+            self.stream.write(f"\r\x1b[2K\x1b[1;92m  {title}\x1b[0m")
+            self.stream.flush()
+            if delay:
+                time.sleep(delay)
+        self.stream.write("\n")
+        if show_tagline:
+            self.stream.write("\x1b[32m  SCAN  /  TEST  /  REPORT\x1b[0m\n")
+        self.stream.write("\n")
+        self.stream.flush()
+
     def start(self) -> ProgressDisplay:
         if self.interactive:
+            self._render()
             self._thread = threading.Thread(target=self._animate, daemon=True)
             self._thread.start()
         else:
@@ -70,8 +97,6 @@ class ProgressDisplay:
                 self.stream.flush()
 
     def set_stage(self, stage: str, totals: dict[str, int] | None = None) -> None:
-        if self.interactive and self.totals:
-            self._render()
         with self._lock:
             self.stage = stage
             self.started = time.monotonic()
@@ -81,10 +106,34 @@ class ProgressDisplay:
         if not self.interactive:
             self.stream.write(f"{stage}...\n")
             self.stream.flush()
+        elif self._thread and not self._stop.is_set():
+            self._render()
 
     def advance(self, label: str) -> None:
         with self._lock:
             self.done[label] += 1
+
+    def show_panel(self, title: str, rows: list[tuple[str, str]]) -> None:
+        """Insert a panel between live redraws without leaving copied bars behind."""
+        with self._paint_lock:
+            if self.vt and self._lines:
+                self.stream.write(f"\x1b[{self._lines}F")
+                for _ in range(self._lines):
+                    self.stream.write("\x1b[2K\n")
+                self.stream.write(f"\x1b[{self._lines}F")
+                self._lines = 0
+            elif self.interactive and self._line_width:
+                self.stream.write("\r" + " " * self._line_width + "\r")
+                self._line_width = 0
+            content = panel(title, rows)
+            if self.vt:
+                heading, separator, *details = content.splitlines()
+                content = "\n".join([self._paint(heading, "1;92"), self._paint(separator, "32"), *details])
+            self.stream.write(content + "\n\n")
+            self.stream.flush()
+            self._last_signature = None
+        if self._thread and not self._stop.is_set():
+            self._render()
 
     def _animate(self) -> None:
         while not self._stop.wait(self.interval):
@@ -96,19 +145,17 @@ class ProgressDisplay:
                 stage = self.stage
                 totals = self.totals.copy()
                 done = self.done.copy()
-                elapsed = int(time.monotonic() - self.started)
-            signature = (stage, tuple(totals.items()), tuple(done.items()), elapsed, final)
+                elapsed_seconds = time.monotonic() - self.started
+            elapsed = int(elapsed_seconds)
+            frame = int(elapsed_seconds / self.interval)
+            signature = (stage, tuple(totals.items()), tuple(done.items()), frame, final)
             if signature == self._last_signature:
                 return
             self._last_signature = signature
-            fraction = sum(done.values()) / sum(totals.values()) if totals else 0.0
-            if final:
-                fraction = 1.0
-            spinner = "|/-\\"[elapsed % 4]
-            title = "Concluído" if final else stage
-            header = f"Identity {spinner} {title}  {elapsed // 60:02d}:{elapsed % 60:02d}"
-            header_color = self._color(fraction if totals or final else min(elapsed / 6, 0.66))
-            lines = [self._paint(header, header_color)]
+            spinner = "|/-\\"[frame % 4]
+            title = "Finalizado" if final else stage
+            header = f"  IDENTITY  {spinner}  {title}  {elapsed // 60:02d}:{elapsed % 60:02d}"
+            lines = [self._paint(header, "1;92")]
             if totals:
                 lines.append(self._colored_bar("Total", sum(done.values()), sum(totals.values())))
                 for label, total in totals.items():
@@ -145,5 +192,13 @@ class ProgressDisplay:
     @staticmethod
     def _bar(label: str, done: int, total: int) -> str:
         fraction = min(done / total, 1) if total else 1
-        filled = round(fraction * 22)
-        return f"  {label[:26]:26} [{'#' * filled}{'-' * (22 - filled)}] {done}/{total} {fraction:5.1%}"
+        columns = shutil.get_terminal_size((88, 24)).columns
+        if columns < 42:
+            label_width = max(3, min(10, columns - 15))
+            bar_width = max(3, columns - label_width - 13)
+            filled = round(fraction * bar_width)
+            return f"  {label[:label_width]:<{label_width}} [{'#' * filled}{'-' * (bar_width - filled)}] {done}/{total}"
+        label_width = min(18, max(8, columns // 4))
+        bar_width = max(5, min(22, columns - label_width - 26))
+        filled = round(fraction * bar_width)
+        return f"  {label[:label_width]:<{label_width}}  [{'#' * filled}{'-' * (bar_width - filled)}]  {done}/{total}  {fraction:4.0%}"

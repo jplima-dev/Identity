@@ -29,6 +29,7 @@ from .campaign import next_cases
 from .offline_model import OfflineCapabilityModel
 from .progress import ProgressDisplay
 from .project import ProjectConfig, parse_project, run_project, write_report
+from .saved_projects import identity_root, load_project, save_project
 from .scanner import discover_agent, discover_api, discover_base_url
 
 ENV_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z_0-9]*)\}")
@@ -59,10 +60,10 @@ class RunConfig:
 
 
 def agent_count(root: Path) -> int:
-    candidates = [p for p in root.glob("*.ag") if p.is_file() and p.stem.isdecimal()]
+    candidates = [p for p in (root / "config").glob("*.ag") if p.is_file() and p.stem.isdecimal()]
     if len(candidates) != 1:
         raise ConfigurationError(
-            "A raiz deve conter exatamente um arquivo numérico .ag (por exemplo, '100.ag')."
+            "config deve conter exatamente um arquivo numérico .ag (por exemplo, '100.ag')."
         )
     count = int(candidates[0].stem)
     if count < 1:
@@ -71,20 +72,41 @@ def agent_count(root: Path) -> int:
 
 
 def run_mode(root: Path) -> str:
-    modes = [name for name in ("agente", "api") if (root / f"{name}.tes").is_file()]
+    modes = [name for name in ("agente", "api") if (root / "config" / f"{name}.tes").is_file()]
     if len(modes) != 1:
-        raise ConfigurationError("Crie exatamente um arquivo de modo na raiz: 'agente.tes' ou 'api.tes'.")
+        raise ConfigurationError("Crie exatamente um arquivo em config: 'agente.tes' ou 'api.tes'.")
     return modes[0]
 
 
 def round_count(root: Path) -> int:
-    candidates = [p for p in root.glob("*.rod") if p.is_file() and p.stem.isdecimal()]
+    candidates = [p for p in (root / "config").glob("*.rod") if p.is_file() and p.stem.isdecimal()]
     if len(candidates) != 1:
-        raise ConfigurationError("O modo agente requer exatamente um arquivo numérico .rod (por exemplo, '10.rod').")
+        raise ConfigurationError("config deve conter exatamente um arquivo numérico .rod (por exemplo, '10.rod').")
     rounds = int(candidates[0].stem)
     if rounds < 1:
         raise ConfigurationError("O número de rodadas deve ser maior que zero.")
     return rounds
+
+
+def set_setting(root: Path, kind: str, value: str) -> Path:
+    value = value.strip()
+    if kind == "tes":
+        value = value.casefold()
+        if value not in {"api", "agente"}:
+            raise ConfigurationError("tes set aceita apenas api ou agente.")
+        name = f"{value}.tes"
+    else:
+        if not value.isdecimal() or int(value) < 1:
+            raise ConfigurationError(f"{kind} set requer um número inteiro maior que zero.")
+        name = f"{int(value)}.{kind}"
+    folder = root / "config"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / name
+    target.write_text("", encoding="utf-8")
+    for file in folder.glob(f"*.{kind}"):
+        if file.is_file() and file != target:
+            file.unlink()
+    return target
 
 
 def _expand(value: str) -> str:
@@ -232,30 +254,113 @@ async def run_agents(count: int, config: RunConfig, output: Path, progress: Prog
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="identity", description="Agentes simultâneos para testar APIs.")
-    subcommands = parser.add_subparsers(dest="command", required=True)
-    run = subcommands.add_parser("run", help="Executa os agentes definidos pelo arquivo .ag na raiz.")
-    run.add_argument("--url", help="Sobrescreve base_url em identity.json.")
-    run.add_argument("--requests-per-agent", type=int, help="Número de requisições por agente.")
-    run.add_argument("--output", type=Path, help="Caminho do arquivo JSONL de resultados.")
-    scam = subcommands.add_parser("scam", help="Escaneia o projeto atual e executa os testes do modo escolhido.")
+    subcommands = parser.add_subparsers(dest="command")
+    cwd = Path.cwd()
+    root = identity_root(cwd, Path(__file__))
+    scam = subcommands.add_parser("scam", help="Escaneia e salva um projeto para execução posterior.")
     scam.add_argument("--project", type=Path, help="Pasta do projeto alvo; padrão: pasta que contém o Identity.")
     scam.add_argument("--url", help="URL base da API.")
-    scam.add_argument("--output", type=Path, help="Caminho do arquivo JSONL de resultados.")
+    for name, description in (("plan", "Mostra o plano de testes sem executá-lo."),):
+        command = subcommands.add_parser(name, help=description)
+        command.add_argument("--project", type=Path, help="Pasta do projeto alvo.")
+        command.add_argument("--url", help="URL base da API.")
+        if name == "plan":
+            command.add_argument("--all", action="store_true", help="Mostra todas as perguntas geradas.")
+    report_command = subcommands.add_parser("report", help="Mostra o último relatório salvo.")
+    report_command.add_argument("project", nargs="?", help="Nome do projeto salvo; sem nome, usa o último relatório.")
+    for name in ("tes", "rod", "ag"):
+        setting = subcommands.add_parser(name, help=f"Mostra ou define o arquivo .{name} ativo.")
+        setting.add_argument("action", nargs="?", choices=["set"], help="Define um novo valor.")
+        setting.add_argument("value", nargs="?", help="Novo valor: api/agente para tes, número para ag/rod.")
+    reserved = {"scam", "plan", "report", "tes", "rod", "ag", "config"}
+    saved_names = []
+    for saved_file in sorted(root.glob("*/scan.json")):
+        name = saved_file.parent.name
+        if name in reserved:
+            continue
+        saved_names.append(name)
+        saved_command = subcommands.add_parser(name, help=f"Executa o projeto salvo {name}.")
+        saved_command.add_argument("--url", help="Sobrescreve a URL base da API.")
+        saved_command.add_argument("--requests-per-agent", type=int, help="Ciclos por agente.")
+        saved_command.add_argument("--output", type=Path, help="Arquivo JSONL de resultados.")
+        saved_command.set_defaults(saved=name)
+    ProgressDisplay().show_intro(show_tagline=len(sys.argv) == 1)
     args = parser.parse_args()
-    cwd = Path.cwd()
-    root = cwd / "Identity" if (cwd / "Identity" / "identity.json").is_file() else cwd
+    if args.command is None:
+        welcome = ProgressDisplay()
+        welcome.show_panel("IDENTITY  /  COMANDOS", [
+            ("scam", "Analisa e salva um projeto"),
+            ("plan", "Mostra os testes planejados"),
+            ("report", "Abre o último relatório"),
+            ("tes / ag / rod", "Consulta ou altera a configuração"),
+        ])
+        if saved_names:
+            welcome.show_panel("PROJETOS SALVOS", [(name, f"identity {name}") for name in saved_names[:8]])
+            if len(saved_names) > 8:
+                print(f"  ... e mais {len(saved_names) - 8} projeto(s)")
+        print("  Use identity --help para ver todas as opções.\n")
+        return
+    if args.command in {"tes", "rod", "ag"}:
+        try:
+            if args.action == "set":
+                if args.value is None and not sys.stdin.isatty():
+                    raise ConfigurationError(f"Informe o valor: identity {args.command} set VALOR.")
+                value = args.value or input(f"Novo valor de {args.command}: ").strip()
+                changed = set_setting(root, args.command, value)
+                ProgressDisplay().show_panel("CONFIGURAÇÃO ATUALIZADA", [("Arquivo", str(changed))])
+                return
+            if args.command == "tes":
+                mode = run_mode(root)
+                value = f"{mode}.tes  ->  modo {mode}"
+            elif args.command == "rod":
+                value = f"{round_count(root)} rodada(s)  ->  {round_count(root)}.rod"
+            else:
+                value = f"{agent_count(root)} agente(s)  ->  {agent_count(root)}.ag"
+        except ConfigurationError as exc:
+            parser.exit(2, f"Erro: {exc}\n")
+        ProgressDisplay().show_panel(f"CONFIGURAÇÃO  /  .{args.command}", [("Arquivo", value), ("Pasta", str(root / 'config'))])
+        return
+    if args.command == "report":
+        report_names = ("relatorio-agente.md", "relatorio-api.md", "relatorio.md")
+        folder = root / args.project if args.project else None
+        if folder and folder.resolve().parent != root.resolve():
+            parser.exit(2, "Erro: nome de projeto inválido.\n")
+        folders = [folder] if folder else [path for path in root.iterdir() if path.is_dir()]
+        candidates = [path / name for path in folders for name in report_names if (path / name).is_file()]
+        if not candidates:
+            parser.exit(2, "Erro: nenhum relatório encontrado.\n")
+        latest = max(candidates, key=lambda path: path.stat().st_mtime)
+        kind = "API" if latest.name == "relatorio-api.md" else "Agente" if latest.name == "relatorio-agente.md" else "Legado"
+        ProgressDisplay().show_panel("IDENTITY  /  RELATÓRIO", [
+            ("Projeto", latest.parent.name), ("Tipo", kind), ("Arquivo", str(latest)),
+        ])
+        print(latest.read_text(encoding="utf-8"))
+        return
+    try:
+        saved_scan = load_project(root, args.saved) if getattr(args, "saved", None) else None
+    except (TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        parser.exit(2, f"Erro: {exc}\n")
     progress = ProgressDisplay().start()
     try:
         count = agent_count(root)
         mode = run_mode(root)
+        rounds_configured = round_count(root)
         config = load_config(root / "identity.json", args.url, getattr(args, "requests_per_agent", None), False, True)
         project_path = None
         discovery = None
         scan_summary = None
-        if args.command in {"scam", "run"}:
-            project_path = (getattr(args, "project", None) or (root.parent if root.name.casefold() == "identity" else cwd)).resolve()
+        if args.command in {"scam", "plan"} or saved_scan:
+            project_path = (Path(saved_scan["project"]) if saved_scan else
+                            getattr(args, "project", None) or (root.parent if root.name.casefold() == "identity" else cwd)).resolve()
             if project_path == root or not project_path.is_dir():
                 raise ConfigurationError("Coloque Identity dentro do projeto ou informe --project.")
+            progress.show_panel("IDENTITY  /  SCANNER DE PROJETOS", [
+                ("Projeto", str(project_path)),
+                ("Modo", "Agente" if mode == "agente" else "API"),
+                ("Agentes", str(count)),
+                ("Execução", f"{rounds_configured} rodadas de classificação" if mode == "agente"
+                 else f"{config.requests_per_agent} ciclo(s) por agente"),
+            ])
             if mode == "api":
                 routes = discover_api(project_path)
                 if not routes:
@@ -271,7 +376,8 @@ def main() -> None:
                 if not isinstance(allow_remote_mutations, bool):
                     raise ConfigurationError("allow_remote_mutations deve ser true ou false.")
                 discovered_url = discover_base_url(project_path)
-                config = replace(config, base_url=args.url or discovered_url or config.base_url)
+                config = replace(config, base_url=args.url or (saved_scan.get("base_url") if saved_scan else None)
+                                 or discovered_url or config.base_url)
                 flows, skipped_routes, standalone = plan_resources(contracts, payloads)
                 hostname = urlsplit(config.base_url).hostname
                 if hostname not in {"127.0.0.1", "localhost", "::1"} and not allow_remote_mutations:
@@ -280,6 +386,13 @@ def main() -> None:
                 scan_summary = {"project": str(project_path), "mode": "api", "base_url": config.base_url,
                                 "routes": contracts, "resource_flows": [flow.collection for flow in flows],
                                 "standalone_routes": standalone, "untested_routes": skipped_routes}
+                progress.show_panel("SCANNER  /  API", [
+                    ("Rotas", str(len(contracts))),
+                    ("Fluxos CRUD", str(len(flows))),
+                    ("Leituras", str(len(standalone))),
+                    ("Sem fluxo", str(len(skipped_routes))),
+                    ("Servidor", config.base_url),
+                ])
             else:
                 discovery = discover_agent(project_path)
                 if not discovery or discovery["kind"] != "yasmin-command":
@@ -287,13 +400,45 @@ def main() -> None:
                 python = project_path / ".venv" / "Scripts" / "python.exe"
                 trainer = Path(__file__).with_name("train_yasmin.py")
                 model = project_path / "Agent" / "modelos" / "intencoes_local.json"
-                if not python.is_file() or not trainer.is_file():
+                if saved_scan and (not python.is_file() or not trainer.is_file()):
                     raise ConfigurationError("Treinador ou Python do agente não encontrado.")
                 # Project test suites may execute desktop tools; the offline classifier is the test boundary.
                 config = replace(config, project=ProjectConfig(project_path, python, trainer,
                     ("--project", "{project_dir}", "--dados", "{output_dir}/treino_exemplos.jsonl", "--saida", "{project_dir}/Agent/modelos/intencoes_local.json"),
                     (), model))
                 scan_summary = {"project": str(project_path), "mode": "agente", "mechanism": discovery, "training_script": str(trainer)}
+        if args.command == "plan":
+            if mode == "api":
+                for flow in flows:
+                    print(f"CRUD  {flow.collection}  ->  criar, atualizar, consultar, listar, excluir")
+                for route in standalone:
+                    print(f"LER   {route['method']} {route['path']}")
+                for item in skipped_routes:
+                    print(f"PULAR {item['route']}: {item['reason']}")
+            else:
+                pool = generate_cases(discovery["examples"], discovery.get("evaluation"))
+                progress.show_panel("SCANNER  /  AGENTE", [
+                    ("Capacidades", str(len(discovery["capabilities"]))),
+                    ("Ferramentas", str(len(discovery.get("registered_tools", [])))),
+                    ("Perguntas", str(len(pool))),
+                    ("Sem exemplos", str(len(discovery.get("uncovered_tools", [])))),
+                    ("Método", "Classificação local, sem executar ferramentas"),
+                ])
+                for case in (pool if args.all else pool[:20]):
+                    print(f"TESTE {case['rotulo']}: {case['texto']}")
+                if len(pool) > 20 and not args.all:
+                    print(f"... mais {len(pool) - 20} perguntas; use --all para listar todas.")
+            return
+        if args.command == "scam":
+            if project_path.name in reserved:
+                raise ConfigurationError(f"Nome de projeto reservado: {project_path.name}")
+            saved = save_project(root, project_path.name, scan_summary)
+            progress.show_panel("PROJETO SALVO", [
+                ("Nome", project_path.name),
+                ("Scan", str(saved)),
+                ("Executar", f"identity {project_path.name}"),
+            ])
+            return
         output_dir = root / (project_path.name if project_path else config.project.path.name if config.project else "results")
         output_dir.mkdir(parents=True, exist_ok=True)
         if scan_summary:
@@ -319,11 +464,18 @@ def main() -> None:
                 discovery["examples"].get("CHAMADA_CURTA", ()),
             )
             pool = generate_cases(discovery["examples"], discovery.get("evaluation"))
+            progress.show_panel("SCANNER  /  AGENTE", [
+                ("Capacidades", str(len(discovery["capabilities"]))),
+                ("Ferramentas", str(len(discovery.get("registered_tools", [])))),
+                ("Perguntas", f"{len(pool)} variações"),
+                ("Sem exemplos", str(len(discovery.get("uncovered_tools", [])))),
+                ("Método", "Classificação local, sem abrir aplicativos"),
+            ])
             (output_dir / "perguntas_geradas.json").write_text(json.dumps(pool, ensure_ascii=False, indent=2), encoding="utf-8")
             assignments = [pool[i % len(pool)] for i in range(count)]
             cursor = count
             rounds = []
-            for round_number in range(1, round_count(root) + 1):
+            for round_number in range(1, rounds_configured + 1):
                 totals = Counter(case["rotulo"] for case in assignments)
                 progress.set_stage(f"Classificação local · rodada {round_number}", dict(totals))
                 current = asyncio.run(run_agent_cases(count, assignments, capability_model, output, progress, round_number))
@@ -344,10 +496,20 @@ def main() -> None:
     finally:
         progress.finish()
     if mode == "api":
-        print(f"Total: {result['requests']} | sucesso: {result['passed']} | falha: {result['failed']} | "
-              f"limpeza: {result['cleanup_ok']} confirmadas, {result['cleanup_failed']} pendentes | média: {result['average_ms']} ms")
+        progress.show_panel("RESULTADO  /  API", [
+            ("Requisições", str(result["requests"])),
+            ("Sucessos", str(result["passed"])),
+            ("Falhas", str(result["failed"])),
+            ("Limpeza", f"{result['cleanup_ok']} confirmadas, {result['cleanup_failed']} pendentes"),
+            ("Latência média", f"{result['average_ms']} ms"),
+            ("Relatório", str(report)),
+        ])
     else:
-        print(f"Rodadas: {len(result['rounds'])} | classificações finais: {result['passed']}/{count} | treino: {project_result['training_exit_code']}")
-    print(f"Relatório: {report}")
+        progress.show_panel("RESULTADO  /  AGENTE", [
+            ("Rodadas", str(len(result["rounds"]))),
+            ("Classificações", f"{result['passed']}/{count} na última rodada"),
+            ("Treino", "OK" if project_result["training_exit_code"] == 0 else "Falhou"),
+            ("Relatório", str(report)),
+        ])
     if failed:
         sys.exit(1)
