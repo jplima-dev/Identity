@@ -58,7 +58,11 @@ def load_adapter(project: Path) -> dict[str, Any] | None:
     if train_messages & eval_messages:
         raise ValueError("A mesma conversa não pode aparecer em train e eval.")
     training = data.get("training")
-    if training is not None:
+    if isinstance(training, dict) and training.get("kind") == "llm":
+        from .llm_adapter import validate_llm_training
+
+        validate_llm_training(project, training, cases)
+    elif training is not None:
         if (not isinstance(training, dict) or not isinstance(training.get("command"), list) or
                 not isinstance(training.get("evaluate_command"), list) or
                 not all(isinstance(arg, str) for arg in [*training["command"], *training["evaluate_command"]]) or
@@ -234,6 +238,17 @@ def write_adapter_report(output_dir: Path, result: dict[str, Any], training: dic
         lines.append(f"- Avaliação candidata: {training['after']['passed']}/{training['after']['total']}")
     if training.get("reason"):
         lines.append(f"- Motivo: {training['reason']}")
+    for item in training.get("rounds", []):
+        lines.extend(["", f"### LLM · rodada {item['round']}", "",
+                      f"- Estado: {item['status']}",
+                      f"- Pares revisados: {item['pairs_reviewed']}",
+                      f"- Passos de otimização: {item['optimization_steps']}",
+                      f"- Métrica anterior: {item['metric_before']}",
+                      f"- Métrica candidata: {item['metric_candidate']}",
+                      f"- Modelo candidato: {item['candidate_model'] or 'não produzido'}",
+                      f"- Modelo ativado: {item['model_published'] or 'não publicado'}"])
+        if item.get("reason"):
+            lines.append(f"- Motivo: {item['reason']}")
     lines.extend(["", "## Falhas", ""])
     with Path(result["output"]).open(encoding="utf-8") as stream:
         failed = []

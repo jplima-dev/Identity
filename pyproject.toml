@@ -1,7 +1,7 @@
 [project]
 name = "identity"
 version = "0.1.0"
-description = "Add your description here"
+description = "CLI para testar APIs e agentes de IA com contratos por projeto"
 readme = "README.md"
 authors = [
     { name = "jplima-dev", email = "jp.lima.tech@gmail.com" }

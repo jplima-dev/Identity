@@ -30,6 +30,7 @@ from .agent_mode import (
     write_training_examples,
 )
 from .api_checks import plan_route_cases
+from .api_contract import api_runtime, load_api_contract
 from .api_discovery import discover_contracts
 from .api_workflow import build_api_plan, plan_resources, run_api_campaign
 from .campaign import next_cases
@@ -38,6 +39,7 @@ from .conversation_ai import (
     generate_conversations,
     save_conversations,
 )
+from .llm_adapter import train_llm_adapter_round
 from .llm_conversations import add_round_pairs
 from .llm_training import train_llm_round
 from .offline_model import OfflineCapabilityModel
@@ -159,7 +161,8 @@ def load_config(path: Path, url_override: str | None = None, requests_override: 
     if not isinstance(raw, dict):
         raise ConfigurationError("identity.json deve conter um objeto JSON.")
 
-    base_url = url_override or raw.get("base_url")
+    base_url = url_override or raw.get("base_url") or (
+        "http://127.0.0.1" if allow_empty_scenarios else None)
     if not isinstance(base_url, str):
         raise ConfigurationError("Defina base_url em identity.json ou passe --url.")
     base_url = _expand(base_url).rstrip("/")
@@ -404,6 +407,7 @@ def main() -> None:
         llm_results = []
         scan_summary = None
         api_plan = None
+        api_contract = {}
         if args.command in {"scam", "plan"} or saved_scan:
             project_path = (Path(saved_scan["project"]) if saved_scan else
                             getattr(args, "project", None) or (root.parent if root.name.casefold() == "identity" else cwd)).resolve()
@@ -418,13 +422,20 @@ def main() -> None:
                  else f"{config.requests_per_agent} ciclo(s) por agente"),
             ])
             if mode == "api":
+                api_contract = load_api_contract(project_path)
+                openapi_path = (project_path / api_contract["openapi_path"]).resolve() if api_contract.get("openapi_path") else None
+                contracts = discover_contracts(project_path, openapi_path)
                 routes = discover_api(project_path)
-                if not routes:
-                    raise ConfigurationError("Nenhuma rota foi encontrada no código do projeto.")
-                contracts = discover_contracts(project_path)
                 seen_contracts = {(route["method"], route["path"]) for route in contracts}
                 contracts.extend({**route, "body_schema": None} for route in routes if (route["method"], route["path"]) not in seen_contracts)
-                raw_api = json.loads((root / "identity.json").read_text(encoding="utf-8"))
+                if not contracts:
+                    raise ConfigurationError("Nenhuma rota foi encontrada no código ou OpenAPI do projeto.")
+                raw_api = {**json.loads((root / "identity.json").read_text(encoding="utf-8")), **api_contract}
+                config = replace(config,
+                                 headers=_headers(raw_api.get("headers", {}), "headers da API"),
+                                 timeout_seconds=float(raw_api.get("timeout_seconds", config.timeout_seconds)),
+                                 max_concurrency=int(raw_api.get("max_concurrency", config.max_concurrency)),
+                                 requests_per_agent=int(raw_api.get("requests_per_agent", config.requests_per_agent)))
                 payloads = raw_api.get("api_payloads", {})
                 if not isinstance(payloads, dict):
                     raise ConfigurationError("api_payloads deve ser um objeto por rota de criação.")
@@ -436,7 +447,8 @@ def main() -> None:
                 if not isinstance(allow_remote_mutations, bool):
                     raise ConfigurationError("allow_remote_mutations deve ser true ou false.")
                 discovered_url = discover_base_url(project_path)
-                config = replace(config, base_url=args.url or (saved_scan.get("base_url") if saved_scan else None)
+                config = replace(config, base_url=args.url or api_contract.get("base_url")
+                                 or (saved_scan.get("base_url") if saved_scan else None)
                                  or discovered_url or config.base_url)
                 flows, skipped_routes, standalone = plan_resources(contracts, payloads)
                 hostname = urlsplit(config.base_url).hostname
@@ -448,9 +460,18 @@ def main() -> None:
                                            "reason": "Mutação remota requer allow_remote_mutations=true."} for case in blocked_cases)
                     direct_cases = [case for case in direct_cases if case not in blocked_cases]
                 explicit_routes = {f"{case['method']} {case['path']}" for case in direct_cases}
+                explicit_routes.update(
+                    f"{case['cleanup'].get('method', 'DELETE')} {case['cleanup']['route']}"
+                    for case in direct_cases if case.get("cleanup"))
+                explicit_routes.update(
+                    f"GET {case['cleanup']['verify_route']}"
+                    for case in direct_cases if (case.get("cleanup") or {}).get("verify_route"))
+                standalone = [route for route in standalone
+                              if f"{route['method']} {route['path']}" not in explicit_routes]
                 skipped_routes = [item for item in skipped_routes if item["route"] not in explicit_routes]
                 api_plan = build_api_plan(contracts, flows, standalone, direct_cases, skipped_routes)
                 scan_summary = {"project": str(project_path), "mode": "api", "base_url": config.base_url,
+                                "contract": "identity-api.json" if api_contract else None,
                                 "routes": contracts, "resource_flows": [flow.collection for flow in flows],
                                 "standalone_routes": standalone, "direct_cases": direct_cases,
                                 "untested_routes": skipped_routes, "test_plan": "testes-api.json"}
@@ -469,10 +490,15 @@ def main() -> None:
                 if adapter:
                     scan_summary = {"project": str(project_path), "mode": "agente",
                                     "adapter": "identity-agent.json", "cases": len(adapter["cases"]),
-                                    "training_configured": bool(adapter.get("training"))}
+                                    "training_configured": bool(adapter.get("training")),
+                                    "training_kind": (adapter.get("training") or {}).get("kind", "legado")}
+                    llm_config = (adapter.get("training") or {}).get("kind") == "llm"
                     progress.show_panel("SCANNER  /  AGENTE", [
                         ("Casos", str(len(adapter["cases"]))),
-                        ("Treino", "configurado" if adapter.get("training") else "não configurado"),
+                        ("Treino", "LLM por rodada" if llm_config else
+                         "configurado" if adapter.get("training") else "não configurado"),
+                        *([("Modelo", adapter["training"]["model_path"]),
+                           ("Dados revisados", adapter["training"]["dataset_path"])] if llm_config else []),
                         ("Método", "Endpoint seguro declarado pelo projeto"),
                     ])
                 else:
@@ -592,9 +618,19 @@ def main() -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         output = args.output or output_dir / "resultados.jsonl"
         if mode == "api":
-            result = asyncio.run(run_api_campaign(count, config.base_url, config.headers, config.timeout_seconds,
-                                                   flows, standalone, output, progress, config.requests_per_agent,
-                                                   direct_cases, config.max_concurrency))
+            if api_contract:
+                with api_runtime(project_path, api_contract, config.base_url, output_dir) as runtime:
+                    result = asyncio.run(run_api_campaign(
+                        count, config.base_url, {**config.headers, **runtime.headers}, config.timeout_seconds,
+                        flows, standalone, output, progress, config.requests_per_agent,
+                        direct_cases, config.max_concurrency, project_path))
+                if runtime.cleanup_errors:
+                    result["cleanup_failed"] += len(runtime.cleanup_errors)
+                    result["runtime_errors"] = runtime.cleanup_errors
+            else:
+                result = asyncio.run(run_api_campaign(count, config.base_url, config.headers, config.timeout_seconds,
+                                                       flows, standalone, output, progress, config.requests_per_agent,
+                                                       direct_cases, config.max_concurrency, project_path))
             result["base_url"] = config.base_url
             result["untested_routes"] = skipped_routes
             result["discovered_routes"] = len(contracts)
@@ -607,26 +643,45 @@ def main() -> None:
                 for key in sorted(discovered_keys - tested_keys) if key not in {item["route"] for item in skipped_routes})]
             progress.set_stage("Gerando relatório")
             report = write_report(output_dir, None, result, None)
-            failed = result["failed"] or result["cleanup_failed"] or not result["requests"]
+            failed = (result["failed"] or result["cleanup_failed"] or not result["requests"]
+                      or bool(result["untested_routes"]))
         else:
             if adapter:
                 pool = [case for case in adapter["cases"] if case["split"] == "eval"]
                 assignments = [pool[index % len(pool)] for index in range(count)]
                 cursor = count
                 round_results = []
+                generic_llm = (adapter.get("training") or {}).get("kind") == "llm"
+                training_rounds = []
                 for round_number in range(1, rounds_configured + 1):
                     current = asyncio.run(run_adapter_cases(count, adapter, output, progress, assignments, round_number,
                                                             config.max_concurrency))
                     round_results.append(current)
-                    progress.show_round(round_number, rounds_configured, current["passed"], current["failed"])
+                    if generic_llm:
+                        trained_round = train_llm_adapter_round(project_path, adapter, output_dir, round_number, progress)
+                        training_rounds.append(trained_round)
+                    progress.show_round(
+                        round_number, rounds_configured, current["passed"], current["failed"],
+                        f"LLM {training_rounds[-1]['status']}" if generic_llm else None,
+                    )
+                    if generic_llm and training_rounds[-1]["status"] in {"bloqueado", "falhou"}:
+                        break
                     assignments, cursor, _ = next_cases(pool, assignments, current["outcomes"], cursor)
                 result = {**round_results[-1], "requests": count * len(round_results),
+                          "rounds_configured": rounds_configured,
                           "rounds": [{"round": item["round"], "passed": item["passed"],
                                       "failed": item["failed"]} for item in round_results]}
-                project_result = train_adapter(project_path, adapter, output_dir, progress, generated)
+                any_published = any(item["status"] == "publicado" for item in training_rounds)
+                project_result = ({"status": "publicado" if any_published else training_rounds[-1]["status"],
+                                   "rounds": training_rounds,
+                                   "reason": None if any_published else training_rounds[-1].get("reason")}
+                                  if generic_llm else train_adapter(project_path, adapter, output_dir, progress, generated))
                 progress.set_stage("Gerando relatório")
                 report = write_adapter_report(output_dir, result, project_result)
-                failed = bool(result["failed"] or project_result["status"] in {"falhou", "rejeitado"})
+                failed = bool(result["failed"] or len(round_results) < rounds_configured
+                              or (generic_llm and (not any_published or any(
+                                  item["status"] in {"falhou", "bloqueado"} for item in training_rounds)))
+                              or (not generic_llm and project_result["status"] in {"falhou", "rejeitado"}))
             else:
                 if config.project is None:
                     raise ConfigurationError("O modo agente requer project em identity.json.")
@@ -712,6 +767,7 @@ def main() -> None:
             progress.show_panel("RESULTADO  /  AGENTE", [
                 ("Conversas", f"{result['passed']}/{count} na última rodada"),
                 ("Treino", project_result["status"]),
+                *([("Motivo", project_result["reason"])] if project_result.get("reason") else []),
                 ("Relatório", str(report)),
             ])
         else:

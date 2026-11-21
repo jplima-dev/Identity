@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +46,38 @@ def _body(route: dict[str, Any], marker: str, override: dict[str, Any] | None) -
     if not isinstance(schema, dict) or schema.get("type") != "object" or not schema.get("properties"):
         return None
     return synthesize_body(schema, marker)
+
+
+def _case_headers(values: dict[str, str]) -> dict[str, str]:
+    def expand(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in os.environ:
+            raise ValueError(f"Variável de ambiente obrigatória não definida: {name}")
+        return os.environ[name]
+
+    return {key: re.sub(r"\$\{([A-Za-z_][A-Za-z_0-9]*)\}", expand, value)
+            for key, value in values.items()}
+
+
+def _cleanup_path(template: str, response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    def replace(match: re.Match[str]) -> str:
+        value = payload
+        for key in match.group(1).split("."):
+            value = value.get(key) if isinstance(value, dict) else None
+        identifier = _valid_id(value)
+        if identifier is None:
+            raise ValueError(f"Resposta não contém identificador seguro para limpeza: {match.group(1)}")
+        return quote(identifier, safe="")
+
+    path = re.sub(r"\{response\.([A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*)\}", replace, template)
+    if "{" in path or "}" in path or not path.startswith("/") or path.startswith("//"):
+        raise ValueError("Caminho de limpeza inválido ou com parâmetro não resolvido.")
+    return path
 
 
 def _valid_id(value: Any) -> str | None:
@@ -151,6 +185,16 @@ def build_api_plan(contracts: list[dict[str, Any]], flows: list[ResourceFlow],
         include(route, "consulta independente")
     for case in direct_cases:
         include(case, f"caso explícito: {case['name']}", case.get("test_body"))
+        cleanup = case.get("cleanup")
+        if cleanup:
+            method = cleanup.get("method", "DELETE")
+            route = next((item for item in contracts
+                          if item["method"] == method and item["path"] == cleanup["route"]), None)
+            include(route, f"limpeza do caso: {case['name']}")
+            if cleanup.get("verify_route"):
+                verified = next((item for item in contracts
+                                 if item["method"] == "GET" and item["path"] == cleanup["verify_route"]), None)
+                include(verified, f"confirma exclusão do caso: {case['name']}")
     reasons = {item["route"]: item["reason"] for item in skipped}
     routes = []
     for contract in contracts:
@@ -247,7 +291,8 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                            flows: list[ResourceFlow], standalone: list[dict[str, Any]], output: Path,
                            progress: ProgressDisplay | None = None, cycles: int = 1,
                            direct_cases: list[dict[str, Any]] | None = None,
-                           max_concurrency: int = 20) -> dict[str, Any]:
+                           max_concurrency: int = 20,
+                           fixture_root: Path | None = None) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     direct_cases = direct_cases or []
     read_cases = [case for case in direct_cases if case["method"] in {"GET", "HEAD", "OPTIONS"}]
@@ -284,6 +329,12 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
         totals[route["method"]] = totals.get(route["method"], 0) + 1
     for _, case in direct_tasks:
         totals[case["method"]] = totals.get(case["method"], 0) + 1
+        cleanup = case.get("cleanup")
+        if cleanup:
+            cleanup_method = cleanup.get("method", "DELETE")
+            totals[cleanup_method] = totals.get(cleanup_method, 0) + 1
+            if cleanup.get("verify_path"):
+                totals["GET"] = totals.get("GET", 0) + 1
     if progress:
         progress.set_stage("Testando API · fluxos com limpeza", totals)
     summary: dict[str, Any] = {"agents": count, "requests": 0, "passed": 0, "failed": 0, "skipped": 0,
@@ -345,11 +396,32 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                           route: dict[str, Any] | None = None,
                           expected_marker: str | None = None,
                           absent_id: tuple[str, str] | None = None,
-                          absent_markers: tuple[str, ...] = ()) -> httpx.Response | None:
+                          absent_markers: tuple[str, ...] = (),
+                          query: dict[str, Any] | None = None,
+                          extra_headers: dict[str, str] | None = None,
+                          form: dict[str, Any] | None = None,
+                          files: dict[str, dict[str, str]] | None = None) -> httpx.Response | None:
             started = perf_counter()
             try:
-                response = await client.request(method, base_url + path, headers=headers, json=body)
+                with ExitStack() as opened:
+                    uploads = {}
+                    for field, item in (files or {}).items():
+                        if fixture_root is None:
+                            raise ValueError("Envio de arquivo exige pasta do projeto.")
+                        source = (fixture_root / item["path"]).resolve()
+                        if not source.is_relative_to(fixture_root.resolve()) or not source.is_file():
+                            raise ValueError(f"Arquivo de teste inválido: {item['path']}")
+                        uploads[field] = (source.name, opened.enter_context(source.open("rb")),
+                                          item.get("content_type", "application/octet-stream"))
+                    response = await client.request(method, base_url + path,
+                                                    headers={**headers, **(extra_headers or {})},
+                                                    params=query, json=body,
+                                                    data=form if form and not uploads else (form or None),
+                                                    files=uploads or None)
                 state_error = None
+                limit_ms = route.get("max_latency_ms") if route else None
+                if limit_ms is not None and (perf_counter() - started) * 1000 > limit_ms:
+                    state_error = f"Latência excedeu {limit_ms} ms"
                 if phase in {"cleanup_verify", "parent_cleanup_verify"} and route and route.get("expected_status") == [404, 410] and response.status_code == 200:
                     state_error = "Registro continua disponível após DELETE"
                 if expected_marker and response.status_code == 200:
@@ -368,7 +440,7 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                         state_error = "Listagem após DELETE não retornou JSON válido"
                 await emit(agent, phase, method, path, response, started, error=state_error, route=route)
                 return response
-            except (httpx.RequestError, ValueError, TypeError) as exc:
+            except (httpx.RequestError, OSError, ValueError, TypeError) as exc:
                 await emit(agent, phase, method, path, None, started, type(exc).__name__)
                 return None
 
@@ -511,7 +583,50 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                     await skipped(agent, "case", case["method"], case["test_path"],
                                   "Escritas suspensas após falha de limpeza")
                     return
-                await request(agent, "case", case["method"], case["test_path"], case.get("test_body"), case)
+                try:
+                    case_headers = _case_headers(case.get("headers", {}))
+                except ValueError as exc:
+                    await skipped(agent, "case", case["method"], case["test_path"], str(exc))
+                    return
+                response = await request(agent, "case", case["method"], case["test_path"],
+                                         case.get("test_body"), case, query=case.get("query"),
+                                         extra_headers=case_headers, form=case.get("form"),
+                                         files=case.get("files"))
+                cleanup = case.get("cleanup")
+                if cleanup and case["method"] not in {"GET", "HEAD", "OPTIONS"}:
+                    if response is None:
+                        record_cleanup(False)
+                        return
+                    try:
+                        path = _cleanup_path(cleanup["path"], response)
+                    except ValueError as exc:
+                        await skipped(agent, "case_cleanup", cleanup.get("method", "DELETE"),
+                                      cleanup["path"], str(exc))
+                        record_cleanup(False)
+                        return
+                    method = cleanup.get("method", "DELETE")
+                    removed = await request(agent, "case_cleanup", method, path,
+                                            cleanup.get("json"),
+                                            {"method": method, "path": cleanup.get("route", path),
+                                             "expected_status": cleanup.get("expected_status", [200, 202, 204])},
+                                            extra_headers=case_headers)
+                    confirmed = removed is not None and removed.status_code in cleanup.get(
+                        "expected_status", [200, 202, 204])
+                    if confirmed and cleanup.get("verify_path"):
+                        try:
+                            verify = _cleanup_path(cleanup["verify_path"], response)
+                        except ValueError as exc:
+                            await skipped(agent, "case_cleanup_verify", "GET",
+                                          cleanup["verify_path"], str(exc))
+                            confirmed = False
+                        else:
+                            checked = await request(agent, "case_cleanup_verify", "GET", verify,
+                                                    route={"method": "GET",
+                                                           "path": cleanup.get("verify_route", verify),
+                                                           "expected_status": [404, 410]},
+                                                    extra_headers=case_headers)
+                            confirmed = checked is not None and checked.status_code in {404, 410}
+                    record_cleanup(confirmed)
 
         try:
             await asyncio.gather(*(exercise(agent, flow) for agent, flow in tasks_for_agents),

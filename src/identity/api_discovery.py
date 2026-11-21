@@ -155,11 +155,14 @@ def _python_routes(file: Path, project: Path, models: dict[str, dict[str, Any]])
     return routes
 
 
-def _openapi_routes(project: Path) -> list[dict[str, Any]]:
+def _openapi_routes(project: Path, explicit: Path | None = None) -> list[dict[str, Any]]:
     routes = []
-    for file in project.rglob("*.json"):
-        if file.name.lower() not in {"openapi.json", "swagger.json"} or any(part in EXCLUDED for part in file.relative_to(project).parts):
-            continue
+    files = [file for file in project.rglob("*.json")
+             if file.name.lower() in {"openapi.json", "swagger.json"}
+             and not any(part in EXCLUDED for part in file.relative_to(project).parts)]
+    if explicit is not None and explicit not in files:
+        files.append(explicit)
+    for file in files:
         try:
             document = json.loads(file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -184,6 +187,10 @@ def _openapi_routes(project: Path) -> list[dict[str, Any]]:
                 result["properties"] = {key: resolve(value, depth + 1) for key, value in result["properties"].items()}
             if "items" in result:
                 result["items"] = resolve(result["items"], depth + 1)
+            for key in ("oneOf", "anyOf"):
+                if isinstance(result.get(key), list):
+                    result[key] = [resolve(part, depth + 1) if isinstance(part, dict) else part
+                                   for part in result[key]]
             return result
 
         for path, operations in document["paths"].items():
@@ -213,7 +220,7 @@ def _openapi_routes(project: Path) -> list[dict[str, Any]]:
     return routes
 
 
-def discover_contracts(project: Path) -> list[dict[str, Any]]:
+def discover_contracts(project: Path, openapi_path: Path | None = None) -> list[dict[str, Any]]:
     found: dict[tuple[str, str], dict[str, Any]] = {}
     files = [file for file in project.rglob("*") if file.is_file() and file.suffix in {".py", ".js", ".ts"}
              and not any(part in EXCLUDED for part in file.relative_to(project).parts)]
@@ -273,6 +280,6 @@ def discover_contracts(project: Path) -> list[dict[str, Any]]:
                 continue
             route.pop("router_owner", None)
             found[(route["method"], route["path"])] = route
-    for route in _openapi_routes(project):
+    for route in _openapi_routes(project, openapi_path):
         found[(route["method"], route["path"])] = route
     return sorted(found.values(), key=lambda route: (route["path"], route["method"]))

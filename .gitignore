@@ -1,3 +1,12 @@
+# Dados locais e credenciais
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+
+# Ambientes, caches e pacotes
 .venv/
 .uv-cache/
 .llm-venv/
@@ -5,8 +14,21 @@
 .llm-tools/
 .llm-build/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Saídas de testes, scans e modelos
+projects/
 results/
+*.log
+run-*.jsonl
+relatorio-api.md
+relatorio-agente.md
+
+# Pastas legadas de resultados locais
 yasmin/
 Torneios-api/
-projects/*/runs/
-projects/*/conversas/.llm-training.lock

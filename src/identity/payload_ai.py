@@ -96,6 +96,13 @@ def _value(schema: dict[str, Any], key: str, marker: str, depth: int = 0) -> Any
 
 
 def synthesize_body(schema: dict[str, Any], marker: str) -> dict[str, Any] | None:
+    choices = schema.get("oneOf") or schema.get("anyOf")
+    if isinstance(choices, list):
+        selected = next((part for part in choices if isinstance(part, dict)
+                         and part.get("type") == "object"), None)
+        if selected is None:
+            return None
+        schema = selected
     if schema.get("type") != "object" or not isinstance(schema.get("properties"), dict):
         return None
     body = _value(schema, "", marker)

@@ -8,12 +8,11 @@ import math
 import os
 import shutil
 import subprocess
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .progress import ProgressDisplay
+from .training_lock import training_lock as _training_lock
 
 MODEL_BYTES = 1_600_000_000
 ENV_BYTES = 3_000_000_000
@@ -240,36 +239,6 @@ def prepare_environment(project: Path, venv: Path, cache: Path, output: Path) ->
         if conversion_check.returncode:
             return None, f"Conversor GGUF instalado, mas importação falhou: {conversion_check.stderr[-500:]}"
     return python, None
-
-
-@contextmanager
-def _training_lock(path: Path) -> Iterator[bool]:
-    """Keep two Identity processes from training the same LLM at once."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as stream:
-        stream.seek(0, 2)
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
-        stream.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            stream.seek(0)
-            if os.name == "nt":
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def train_llm_round(project: Path, conversations: Path, output: Path, round_number: int,

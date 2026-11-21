@@ -72,7 +72,12 @@ def debug_summary(report: Path) -> tuple[list[tuple[str, str]], list[str], int]:
     configured = result.get("rounds_configured") if mode == "agente" else None
     completed = len(result.get("rounds", [])) if mode == "agente" else 0
     incomplete = type(configured) is int and configured > completed
-    state = "Campanha incompleta" if incomplete else "Falhas encontradas" if data.get("failed") else "Sem falhas detectadas"
+    blocked_routes = bool(result.get("untested_routes")) if mode == "api" else False
+    state = ("Campanha incompleta" if incomplete else
+             "Falhas encontradas" if result.get("failed") or result.get("cleanup_failed") else
+             "Cobertura incompleta" if blocked_routes else
+             "Falhas encontradas" if data.get("failed") else
+             "Sem falhas detectadas")
     rows = [("Estado", state)]
     if mode == "api":
         rows.extend([
@@ -98,6 +103,14 @@ def debug_summary(report: Path) -> tuple[list[tuple[str, str]], list[str], int]:
             if training.get("before") and training.get("after"):
                 before, after = training["before"], training["after"]
                 rows.append(("Avaliação", f"{before['passed']}/{before['total']} → {after['passed']}/{after['total']}"))
+            generic_rounds = training.get("rounds", [])
+            if generic_rounds:
+                rows.append(("Passos LLM", str(sum(item.get("optimization_steps", 0) for item in generic_rounds))))
+                rows.append(("Candidatos rejeitados", str(sum(item.get("status") == "rejeitado"
+                                                            for item in generic_rounds))))
+                latest = generic_rounds[-1]
+                if latest.get("metric_before") is not None and latest.get("metric_candidate") is not None:
+                    rows.append(("Última avaliação", f"{latest['metric_before']} → {latest['metric_candidate']}"))
         llm = data.get("llm_training", [])
         if isinstance(llm, list) and llm:
             rows.append(("LLM de conversa", str(llm[-1].get("status", "não informado"))))
