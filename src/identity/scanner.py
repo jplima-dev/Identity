@@ -90,7 +90,7 @@ def discover_agent(project: Path) -> dict[str, Any] | None:
     if bridge.is_file():
         content = bridge.read_text(encoding="utf-8", errors="replace")
         port = re.search(r"^PORTA\s*=\s*(\d+)", content, re.MULTILINE)
-        if port and 'self.path != "/command"' in content:
+        if port and re.search(r"['\"]/command['\"]", content):
             return {"url": f"http://127.0.0.1:{port.group(1)}/command", "kind": "yasmin-command", "source": str(bridge.relative_to(project)),
                     "capabilities": capabilities, "examples": examples, "evaluation": evaluation,
                     "registered_tools": sorted(registered_tools.values(), key=lambda item: item["name"]),

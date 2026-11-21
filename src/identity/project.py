@@ -116,13 +116,14 @@ def write_report(output_dir: Path, project: ProjectConfig | None, api: dict[str,
             elif not item["passed"]:
                 api_errors[f"{item['method']} {item['path']}: {item['error'] or 'HTTP ' + str(item['status'])}"] += 1
     lines = [
-        f"# Relatório: {output_dir.name}",
+        f"# Relatório: {output_dir.parent.parent.name if output_dir.parent.name == 'runs' else output_dir.name}",
         "",
         "## API",
         "",
         f"- Agentes: {api['agents']}",
         f"- URL base: {api.get('base_url', 'não informada')}",
         f"- Endpoints descobertos: {api.get('discovered_routes', 'não informado')}",
+        f"- Rotas executadas: {api.get('tested_routes', 'não informado')}/{api.get('discovered_routes', 'não informado')}",
         f"- Cenários: {api.get('cases', 'não informado')} (fluxos CRUD: {api.get('complex_cases', 'não informado')})",
         f"- Requisições: {api['requests']}",
         f"- Sucessos: {api['passed']}",

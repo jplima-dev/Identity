@@ -10,7 +10,7 @@ from pathlib import Path
 
 from identity.agent_mode import generate_cases, write_training_examples
 from identity.api_discovery import discover_contracts
-from identity.api_workflow import plan_resources, run_api_campaign
+from identity.api_workflow import build_api_plan, plan_resources, run_api_campaign
 from identity.scanner import discover_agent
 
 
@@ -165,13 +165,17 @@ class ApiWorkflowTests(unittest.TestCase):
                 (config / "10.rod").touch()
                 (identity / "identity.json").write_text(json.dumps({"base_url": f"http://127.0.0.1:{server.server_port}"}),
                                                         encoding="utf-8")
+                preview = subprocess.run([sys.executable, "-m", "identity", "plan"], cwd=identity,
+                                         text=True, capture_output=True, check=False, timeout=15)
+                self.assertEqual(preview.returncode, 0, preview.stderr)
+                self.assertIn("identitypreview", preview.stdout)
                 scan = subprocess.run([sys.executable, "-m", "identity", "scam"], cwd=identity,
                                       text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(scan.returncode, 0, scan.stderr + scan.stdout)
                 completed = subprocess.run([sys.executable, "-m", "identity", root.name], cwd=identity,
                                            text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(completed.returncode, 1, completed.stderr + completed.stdout)
-                report = (identity / root.name / "relatorio-api.md").read_text(encoding="utf-8")
+                report = next((identity / "projects" / root.name / "runs").glob("*/relatorio-api.md")).read_text(encoding="utf-8")
                 self.assertIn("Recursos excluídos ao final: 2", report)
             self.assertEqual(result["cleanup_ok"], 3)
             self.assertEqual(result["cleanup_failed"], 0)
@@ -198,9 +202,15 @@ class ApiWorkflowTests(unittest.TestCase):
                 "components": {"schemas": {"Item": {"type": "object", "required": ["name"],
                                                       "properties": {"name": {"type": "string"}}}}},
             }), encoding="utf-8")
-            flows, skipped, _ = plan_resources(discover_contracts(root))
+            contracts = discover_contracts(root)
+            flows, skipped, standalone = plan_resources(contracts)
             self.assertEqual(len(flows), 1)
             self.assertIn("DELETE /danger", [item["route"] for item in skipped])
+            plan = build_api_plan(contracts, flows, standalone, [], skipped)
+            self.assertEqual(plan["planned"], 4)
+            self.assertEqual(plan["blocked"], 1)
+            self.assertIn("Sem fluxo isolado", next(route["reason"] for route in plan["routes"]
+                                                     if route["path"] == "/danger"))
 
     def test_router_mount_prefix_and_flask_methods_are_discovered(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -229,8 +239,10 @@ class ApiWorkflowTests(unittest.TestCase):
                                                      'registro.registrar(Ferramenta("extra", "Outro recurso"))\n', encoding="utf-8")
             bridge = root / "Agent" / "servicos" / "comandos_workspace.py"
             bridge.parent.mkdir(parents=True)
-            bridge.write_text('PORTA = 1234\nself.path != "/command"\n', encoding="utf-8")
+            bridge.write_text('PORTA = 1234\nself.path not in {"/command", "/training/identity"}\n', encoding="utf-8")
             discovery = discover_agent(root)
+            self.assertEqual(discovery["kind"], "yasmin-command")
+            self.assertEqual(discovery["url"], "http://127.0.0.1:1234/command")
             self.assertEqual(discovery["uncovered_tools"], ["extra"])
             cases = generate_cases(discovery["examples"], discovery["evaluation"])
             self.assertGreater(len(cases), 2)

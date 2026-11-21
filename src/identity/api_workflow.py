@@ -15,6 +15,8 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from .api_checks import check_response
+from .payload_ai import synthesize_body
 from .progress import ProgressDisplay
 
 PARAM = re.compile(r"\{([^{}]+)\}")
@@ -25,7 +27,7 @@ SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 class ResourceFlow:
     collection: str
     create: dict[str, Any]
-    update: dict[str, Any]
+    update: dict[str, Any] | None
     read: dict[str, Any] | None
     list_route: dict[str, Any] | None
     delete: dict[str, Any]
@@ -35,58 +37,13 @@ class ResourceFlow:
     parent: ResourceFlow | None = None
 
 
-def _sample(schema: dict[str, Any], key: str, marker: str, depth: int = 0) -> Any:
-    if depth > 5:
-        return None
-    if key.casefold() in {"name", "nome", "username", "email", "title", "titulo"} and not schema.get("enum"):
-        if schema.get("format") == "email" or key.casefold() == "email":
-            return f"identity+{marker}@example.com"
-        return f"identity_{marker}"
-    if "example" in schema:
-        return schema["example"]
-    if schema.get("enum"):
-        return schema["enum"][0]
-    if "const" in schema:
-        return schema["const"]
-    choices = schema.get("anyOf") or schema.get("oneOf")
-    if isinstance(choices, list):
-        choice = next((item for item in choices if item.get("type") != "null"), None)
-        return _sample(choice, key, marker, depth + 1) if choice else None
-    kind = schema.get("type", "string")
-    if kind == "object":
-        properties = schema.get("properties", {})
-        wanted = set(schema.get("required", []))
-        wanted.update(name for name in properties if name.casefold() in {"name", "nome", "username", "email", "title", "titulo"})
-        return {name: _sample(properties[name], name, marker, depth + 1) for name in properties if name in wanted}
-    if kind == "array":
-        return [_sample(schema.get("items", {"type": "string"}), key, marker, depth + 1)]
-    if kind == "integer":
-        return max(int(schema.get("minimum", 1)), 1)
-    if kind == "number":
-        return max(float(schema.get("minimum", 1)), 1.0)
-    if kind == "boolean":
-        return True
-    if schema.get("format") == "email" or "email" in key.casefold():
-        return f"identity+{marker}@example.com"
-    if schema.get("format") == "uuid":
-        return str(uuid.uuid4())
-    if schema.get("format") == "date":
-        return "2030-01-01"
-    if schema.get("format") == "date-time":
-        return "2030-01-01T00:00:00Z"
-    if "password" in key.casefold() or "senha" in key.casefold():
-        return f"Identity_{marker}_Aa1!"
-    text = f"identity_{marker}"
-    return text.ljust(max(int(schema.get("minLength", 1)), len(text)), "x")[:int(schema.get("maxLength", 1000))]
-
-
 def _body(route: dict[str, Any], marker: str, override: dict[str, Any] | None) -> dict[str, Any] | None:
     if override is not None:
         return json.loads(json.dumps(override).replace("{identity_marker}", marker))
     schema = route.get("body_schema")
     if not isinstance(schema, dict) or schema.get("type") != "object" or not schema.get("properties"):
         return None
-    return _sample(schema, "", marker)
+    return synthesize_body(schema, marker)
 
 
 def _valid_id(value: Any) -> str | None:
@@ -134,21 +91,26 @@ def plan_resources(contracts: list[dict[str, Any]], payloads: dict[str, Any] | N
         overrides = payloads.get(path, {}) if isinstance(payloads.get(path, {}), dict) else {}
         create_body = overrides.get("create")
         update_body = overrides.get("update")
-        if not update or not delete or not (read or listed):
-            skipped.append({"route": f"POST {path}", "reason": "Fluxo requer atualização, leitura e DELETE do mesmo recurso."})
+        if not delete:
+            skipped.append({"route": f"POST {path}", "reason": "Nenhum DELETE do item encontrado para limpar o registro criado."})
             continue
         sample_create = _body(create, "identityexample", create_body)
-        if sample_create is None or _body(update, "example", update_body) is None:
-            skipped.append({"route": f"POST {path}", "reason": "Corpo de criação/atualização desconhecido; configure api_payloads."})
+        if sample_create is None:
+            skipped.append({"route": f"POST {path}", "reason": "Corpo de criação desconhecido; configure api_payloads."})
             continue
         if "identityexample" not in json.dumps(sample_create):
             skipped.append({"route": f"POST {path}", "reason": "Criação precisa de um campo único para localizar e limpar o registro de teste."})
             continue
+        if update and _body(update, "example", update_body) is None:
+            skipped.append({"route": f"{update['method']} {update['path']}",
+                            "reason": "Corpo de atualização desconhecido; configure api_payloads."})
+            update = None
         flow = ResourceFlow(create["path"], create, update, read, listed, delete, parameters[-1], create_body, update_body, parent)
         flows.append(flow)
         flows_by_collection[path] = flow
-        covered.update({("POST", path), (update["method"], update["path"].rstrip("/") or "/"),
-                        ("DELETE", delete["path"].rstrip("/") or "/")})
+        covered.update({("POST", path), ("DELETE", delete["path"].rstrip("/") or "/")})
+        if update:
+            covered.add((update["method"], update["path"].rstrip("/") or "/"))
         if read:
             covered.add(("GET", read["path"].rstrip("/") or "/"))
         if listed:
@@ -158,6 +120,49 @@ def plan_resources(contracts: list[dict[str, Any]], payloads: dict[str, Any] | N
         if key not in covered and route not in standalone and not any(item["route"] == f"{route['method']} {route['path']}" for item in skipped):
             skipped.append({"route": f"{route['method']} {route['path']}", "reason": "Sem fluxo isolado e reversível para este endpoint."})
     return flows, skipped, standalone
+
+
+def build_api_plan(contracts: list[dict[str, Any]], flows: list[ResourceFlow],
+                   standalone: list[dict[str, Any]], direct_cases: list[dict[str, Any]],
+                   skipped: list[dict[str, str]]) -> dict[str, Any]:
+    """Give every discovered route a planned test or an explicit blocking reason."""
+    planned: dict[str, list[dict[str, Any]]] = {}
+
+    def include(route: dict[str, Any] | None, name: str, body: dict[str, Any] | None = None,
+                cleanup: dict[str, str] | None = None) -> None:
+        if route:
+            test = {"name": name, "method": route["method"], "path": route.get("test_path", route["path"]),
+                    "expected_status": route.get("expected_status")}
+            if body is not None:
+                test["body_example"] = body
+            if cleanup is not None:
+                test["cleanup"] = cleanup
+            planned.setdefault(f"{route['method']} {route['path']}", []).append(test)
+
+    for flow in flows:
+        cleanup = {"method": "DELETE", "path": flow.delete["path"]}
+        include(flow.create, f"fluxo {flow.collection}: criar", _body(flow.create, "identitypreview", flow.create_body), cleanup)
+        if flow.update:
+            include(flow.update, f"fluxo {flow.collection}: atualizar",
+                    _body(flow.update, "identitypreview_updated", flow.update_body))
+        for step, route in (("consultar", flow.read), ("listar", flow.list_route), ("excluir", flow.delete)):
+            include(route, f"fluxo {flow.collection}: {step}")
+    for route in standalone:
+        include(route, "consulta independente")
+    for case in direct_cases:
+        include(case, f"caso explícito: {case['name']}", case.get("test_body"))
+    reasons = {item["route"]: item["reason"] for item in skipped}
+    routes = []
+    for contract in contracts:
+        key = f"{contract['method']} {contract['path']}"
+        tests = planned.get(key, [])
+        routes.append({"method": contract["method"], "path": contract["path"],
+                       "source": contract.get("source"), "tests": tests,
+                       "status": "planejada" if tests else "bloqueada",
+                       "reason": None if tests else reasons.get(key, "Nenhum teste reversível foi gerado.")})
+    return {"version": 1, "routes": routes,
+            "planned": sum(bool(route["tests"]) for route in routes),
+            "blocked": sum(not route["tests"] for route in routes)}
 
 
 def _created_id(response: httpx.Response, parameter: str, collection: str) -> str | None:
@@ -203,10 +208,55 @@ def _find_created(data: Any, marker: str, parameter: str) -> str | None:
     return None
 
 
+def _contains_marker(value: Any, marker: str) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_marker(item, marker) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_marker(item, marker) for item in value)
+    return isinstance(value, str) and marker in value
+
+
+def _contains_id(value: Any, parameter: str, identifier: str) -> bool:
+    if isinstance(value, dict):
+        if any(_valid_id(value.get(key)) == identifier for key in (parameter, "id", "uuid")):
+            return True
+        return any(_contains_id(item, parameter, identifier) for item in value.values() if isinstance(item, (dict, list)))
+    if isinstance(value, list):
+        return any(_contains_id(item, parameter, identifier) for item in value)
+    return False
+
+
+def _deleted_and_absent(response: httpx.Response | None) -> bool:
+    if response is None:
+        return False
+    return response.status_code in {404, 410}
+
+
+def _absent_from_list(response: httpx.Response | None, parameter: str, identifier: str,
+                      markers: tuple[str, ...]) -> bool:
+    if response is None or response.status_code != 200:
+        return False
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    return not _contains_id(data, parameter, identifier) and not any(_contains_marker(data, marker) for marker in markers)
+
+
 async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], timeout: float,
                            flows: list[ResourceFlow], standalone: list[dict[str, Any]], output: Path,
-                           progress: ProgressDisplay | None = None, cycles: int = 1) -> dict[str, Any]:
+                           progress: ProgressDisplay | None = None, cycles: int = 1,
+                           direct_cases: list[dict[str, Any]] | None = None,
+                           max_concurrency: int = 20) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
+    direct_cases = direct_cases or []
+    read_cases = [case for case in direct_cases if case["method"] in {"GET", "HEAD", "OPTIONS"}]
+    write_cases = [case for case in direct_cases if case["method"] not in {"GET", "HEAD", "OPTIONS"}]
+    direct_tasks = [(agent, read_cases[(agent - 1 + iteration) % len(read_cases)])
+                    for agent in range(1, count + 1) for iteration in range(cycles)] if read_cases else []
+    for index, case in enumerate(read_cases[len(direct_tasks):], len(direct_tasks) + 1):
+        direct_tasks.append(((index - 1) % count + 1, case))
+    direct_tasks.extend(((index % count) + 1, case) for index, case in enumerate(write_cases))
     tasks_for_agents = [(agent_id, flows[(agent_id - 1 + iteration) % len(flows)])
                         for agent_id in range(1, count + 1) for iteration in range(cycles)] if flows else []
     for index, flow in enumerate(flows[len(tasks_for_agents):], len(tasks_for_agents) + 1):
@@ -217,18 +267,28 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
         read_tasks.append(((index - 1) % count + 1, route))
     totals: dict[str, int] = {}
     for _, flow in tasks_for_agents:
-        for method in ("POST", flow.update["method"], *("GET" for _ in (flow.read, flow.list_route) if _), "DELETE"):
+        for method in ("POST", *([flow.update["method"]] if flow.update else []),
+                       *("GET" for _ in (flow.read, flow.list_route) if _), "DELETE"):
             totals[method] = totals.get(method, 0) + 1
+        update_schema = flow.update.get("body_schema") if flow.update else None
+        if flow.update and flow.update["method"] == "PUT" and isinstance(update_schema, dict) and update_schema.get("required"):
+            totals["PUT"] = totals.get("PUT", 0) + 1
+        if flow.read:
+            totals["GET"] = totals.get("GET", 0) + 1
         if flow.parent:
             totals["POST"] += 1
             totals["DELETE"] += 1
+            if flow.parent.read:
+                totals["GET"] += 1
     for _, route in read_tasks:
         totals[route["method"]] = totals.get(route["method"], 0) + 1
+    for _, case in direct_tasks:
+        totals[case["method"]] = totals.get(case["method"], 0) + 1
     if progress:
         progress.set_stage("Testando API · fluxos com limpeza", totals)
     summary: dict[str, Any] = {"agents": count, "requests": 0, "passed": 0, "failed": 0, "skipped": 0,
                                "cleanup_ok": 0, "cleanup_failed": 0, "average_ms": 0.0, "output": str(output),
-                               "cases": len(flows) + len(standalone), "complex_cases": len(flows)}
+                               "cases": len(flows) + len(standalone) + len(direct_cases), "complex_cases": len(flows)}
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=1000)
 
     async def writer() -> None:
@@ -248,26 +308,65 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                 summary["average_ms"] = round(total_ms / summary["requests"], 2)
 
     async def emit(agent: int, phase: str, method: str, path: str, response: httpx.Response | None,
-                   started: float, error: str | None = None, skipped: bool = False) -> None:
+                   started: float, error: str | None = None, skipped: bool = False,
+                   route: dict[str, Any] | None = None) -> None:
         status = response.status_code if response is not None else None
         expected = {"POST": {200, 201, 202}, "PUT": {200, 204}, "PATCH": {200, 204},
                     "GET": {200}, "DELETE": {200, 202, 204}, "HEAD": {200}, "OPTIONS": {200, 204}}
+        passed = False
+        statuses = sorted(expected[method])
+        if response is not None and not skipped:
+            passed, validation_error, statuses = check_response(response, route, expected[method])
+            error = error or validation_error
+            if error:
+                passed = False
         await queue.put({"timestamp": datetime.now(UTC).isoformat(), "agent": agent, "phase": phase,
-                         "method": method, "path": path, "status": status, "expected_status": sorted(expected[method]),
-                         "passed": not skipped and status in expected[method], "skipped": skipped,
+                         "method": method, "path": path, "route": route.get("path") if route else path,
+                         "case": route.get("name") if route else None,
+                         "status": status, "expected_status": statuses,
+                         "passed": passed, "skipped": skipped,
                          "latency_ms": round((perf_counter() - started) * 1000, 2) if not skipped else 0.0,
                          "error": error})
 
-    limits = httpx.Limits(max_connections=min(count, 20), max_keepalive_connections=min(count, 20))
-    semaphore = asyncio.Semaphore(20)
+    active = min(count, max_concurrency)
+    limits = httpx.Limits(max_connections=active, max_keepalive_connections=active)
+    semaphore = asyncio.Semaphore(active)
+    stop_creating = asyncio.Event()
+
+    def record_cleanup(confirmed: bool) -> None:
+        summary["cleanup_ok" if confirmed else "cleanup_failed"] += 1
+        if not confirmed:
+            stop_creating.set()
+
     async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False) as client:
         writer_task = asyncio.create_task(writer())
 
-        async def request(agent: int, phase: str, method: str, path: str, body: Any = None) -> httpx.Response | None:
+        async def request(agent: int, phase: str, method: str, path: str, body: Any = None,
+                          route: dict[str, Any] | None = None,
+                          expected_marker: str | None = None,
+                          absent_id: tuple[str, str] | None = None,
+                          absent_markers: tuple[str, ...] = ()) -> httpx.Response | None:
             started = perf_counter()
             try:
                 response = await client.request(method, base_url + path, headers=headers, json=body)
-                await emit(agent, phase, method, path, response, started)
+                state_error = None
+                if phase in {"cleanup_verify", "parent_cleanup_verify"} and route and route.get("expected_status") == [404, 410] and response.status_code == 200:
+                    state_error = "Registro continua disponível após DELETE"
+                if expected_marker and response.status_code == 200:
+                    try:
+                        if not _contains_marker(response.json(), expected_marker):
+                            state_error = f"Registro criado/atualizado não encontrado na resposta: {expected_marker}"
+                    except ValueError:
+                        state_error = "Consulta não retornou JSON válido para verificar o registro"
+                if absent_id and response.status_code == 200:
+                    try:
+                        data = response.json()
+                        if (_contains_id(data, *absent_id)
+                                or any(_contains_marker(data, marker) for marker in absent_markers)):
+                            state_error = "Registro continua listado após DELETE"
+                    except ValueError:
+                        state_error = "Listagem após DELETE não retornou JSON válido"
+                await emit(agent, phase, method, path, response, started, error=state_error, route=route)
                 return response
             except (httpx.RequestError, ValueError, TypeError) as exc:
                 await emit(agent, phase, method, path, None, started, type(exc).__name__)
@@ -278,6 +377,10 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
 
         async def exercise(agent: int, flow: ResourceFlow) -> None:
             async with semaphore:
+                if stop_creating.is_set():
+                    await skipped(agent, "create", "POST", flow.collection,
+                                  "Novas criações suspensas após falha de limpeza")
+                    return
                 marker = uuid.uuid4().hex[:16]
                 created_id: str | None = None
                 parent_id: str | None = None
@@ -297,7 +400,7 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                 try:
                     if parent:
                         parent_response = await request(agent, "parent_create", "POST", parent.collection,
-                                                        _body(parent.create, parent_marker, parent.create_body))
+                                                        _body(parent.create, parent_marker, parent.create_body), parent.create)
                         if parent_response is not None and parent_response.status_code in {200, 201, 202}:
                             parent_id = _created_id(parent_response, parent.parameter, parent.collection)
                     if parent and not parent_id:
@@ -308,20 +411,31 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                                 await skipped(agent, phase, route["method"], route["path"], "Recurso pai indisponível")
                         return
                     create_path = path_for(flow.create)
-                    response = await request(agent, "create", "POST", create_path, _body(flow.create, marker, flow.create_body))
+                    response = await request(agent, "create", "POST", create_path, _body(flow.create, marker, flow.create_body), flow.create)
                     if response is not None and response.status_code in {200, 201, 202}:
                         created_id = _created_id(response, flow.parameter, create_path)
                     if created_id:
                         detail = path_for(flow.delete, created_id)
-                        update_body = _body(flow.update, marker + "_updated", flow.update_body)
-                        if update_body is not None:
-                            await request(agent, "update", flow.update["method"], path_for(flow.update, created_id), update_body)
-                        else:
-                            await skipped(agent, "update", flow.update["method"], detail, "Corpo de atualização ausente")
+                        updated_marker = marker[:12] + "u"
+                        updated = None
+                        if flow.update:
+                            update_body = _body(flow.update, updated_marker, flow.update_body)
+                            if update_body is not None:
+                                updated = await request(agent, "update", flow.update["method"],
+                                                        path_for(flow.update, created_id), update_body, flow.update)
+                            else:
+                                await skipped(agent, "update", flow.update["method"], detail, "Corpo de atualização ausente")
+                        expected_marker = updated_marker if updated is not None and updated.status_code in {200, 204} else marker
+                        update_schema = flow.update.get("body_schema") if flow.update else None
+                        if flow.update and flow.update["method"] == "PUT" and isinstance(update_schema, dict) and update_schema.get("required"):
+                            invalid_route = {**flow.update, "expected_status": [400, 422], "response_schema": None}
+                            await request(agent, "invalid_update", "PUT", path_for(flow.update, created_id), {}, invalid_route)
                         if flow.read:
-                            await request(agent, "read", "GET", path_for(flow.read, created_id))
+                            await request(agent, "read", "GET", path_for(flow.read, created_id),
+                                          route=flow.read, expected_marker=expected_marker)
                         if flow.list_route:
-                            await request(agent, "list", "GET", path_for(flow.list_route))
+                            await request(agent, "list", "GET", path_for(flow.list_route),
+                                          route=flow.list_route, expected_marker=expected_marker)
                     else:
                         for phase, route in (("update", flow.update), ("read", flow.read), ("list", flow.list_route)):
                             if route:
@@ -329,7 +443,7 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                 finally:
                     # A exclusão é tentada mesmo se atualização ou consulta falhar.
                     if not created_id and flow.list_route and (not parent or parent_id):
-                        recovered = await request(agent, "recover", "GET", path_for(flow.list_route))
+                        recovered = await request(agent, "recover", "GET", path_for(flow.list_route), route=flow.list_route)
                         if recovered is not None and recovered.status_code == 200:
                             try:
                                 created_id = _find_created(recovered.json(), marker, flow.parameter)
@@ -338,16 +452,28 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                         if created_id:
                             detail = path_for(flow.delete, created_id)
                     if created_id:
-                        deleted = await request(agent, "cleanup", "DELETE", detail)
+                        deleted = await request(agent, "cleanup", "DELETE", detail, route=flow.delete)
                         if deleted is None or deleted.status_code not in {200, 202, 204}:
-                            deleted = await request(agent, "cleanup_retry", "DELETE", detail)
-                        summary["cleanup_ok" if deleted is not None and deleted.status_code in {200, 202, 204} else "cleanup_failed"] += 1
+                            deleted = await request(agent, "cleanup_retry", "DELETE", detail, route=flow.delete)
+                        confirmed = deleted is not None and deleted.status_code in {200, 202, 204}
+                        if confirmed and flow.read:
+                            verify_route = {**flow.read, "expected_status": [404, 410], "response_schema": None}
+                            verified = await request(agent, "cleanup_verify", "GET", path_for(flow.read, created_id),
+                                                     route=verify_route)
+                            confirmed = _deleted_and_absent(verified)
+                        elif confirmed and flow.list_route:
+                            verified = await request(agent, "cleanup_verify", "GET", path_for(flow.list_route),
+                                                     route=flow.list_route, absent_id=(flow.parameter, created_id),
+                                                     absent_markers=(marker, marker[:12] + "u"))
+                            confirmed = _absent_from_list(verified, flow.parameter, created_id,
+                                                          (marker, marker[:12] + "u"))
+                        record_cleanup(confirmed)
                     elif not parent or parent_id:
                         await skipped(agent, "cleanup", "DELETE", detail, "ID não encontrado; exclusão impossível")
-                        summary["cleanup_failed"] += 1
+                        record_cleanup(False)
                     if parent:
                         if not parent_id and parent.list_route:
-                            recovered = await request(agent, "parent_recover", "GET", parent.list_route["path"])
+                            recovered = await request(agent, "parent_recover", "GET", parent.list_route["path"], route=parent.list_route)
                             if recovered is not None and recovered.status_code == 200:
                                 try:
                                     parent_id = _find_created(recovered.json(), parent_marker, parent.parameter)
@@ -355,21 +481,42 @@ async def run_api_campaign(count: int, base_url: str, headers: dict[str, str], t
                                     pass
                         if parent_id:
                             parent_detail = parent.delete["path"].replace("{" + parent.parameter + "}", quote(parent_id, safe=""))
-                            deleted = await request(agent, "parent_cleanup", "DELETE", parent_detail)
+                            deleted = await request(agent, "parent_cleanup", "DELETE", parent_detail, route=parent.delete)
                             if deleted is None or deleted.status_code not in {200, 202, 204}:
-                                deleted = await request(agent, "parent_cleanup_retry", "DELETE", parent_detail)
-                            summary["cleanup_ok" if deleted is not None and deleted.status_code in {200, 202, 204} else "cleanup_failed"] += 1
+                                deleted = await request(agent, "parent_cleanup_retry", "DELETE", parent_detail, route=parent.delete)
+                            confirmed = deleted is not None and deleted.status_code in {200, 202, 204}
+                            if confirmed and parent.read:
+                                verify_route = {**parent.read, "expected_status": [404, 410], "response_schema": None}
+                                read_detail = parent.read["path"].replace("{" + parent.parameter + "}", quote(parent_id, safe=""))
+                                verified = await request(agent, "parent_cleanup_verify", "GET", read_detail,
+                                                         route=verify_route)
+                                confirmed = _deleted_and_absent(verified)
+                            elif confirmed and parent.list_route:
+                                verified = await request(agent, "parent_cleanup_verify", "GET", parent.list_route["path"],
+                                                         route=parent.list_route, absent_id=(parent.parameter, parent_id),
+                                                         absent_markers=(parent_marker,))
+                                confirmed = _absent_from_list(verified, parent.parameter, parent_id, (parent_marker,))
+                            record_cleanup(confirmed)
                         else:
                             await skipped(agent, "parent_cleanup", "DELETE", parent.delete["path"], "ID do recurso pai indisponível")
-                            summary["cleanup_failed"] += 1
+                            record_cleanup(False)
 
         async def read_only(agent: int, route: dict[str, Any]) -> None:
             async with semaphore:
-                await request(agent, "standalone", route["method"], route["path"])
+                await request(agent, "standalone", route["method"], route["path"], route=route)
+
+        async def direct(agent: int, case: dict[str, Any]) -> None:
+            async with semaphore:
+                if stop_creating.is_set() and case["method"] not in {"GET", "HEAD", "OPTIONS"}:
+                    await skipped(agent, "case", case["method"], case["test_path"],
+                                  "Escritas suspensas após falha de limpeza")
+                    return
+                await request(agent, "case", case["method"], case["test_path"], case.get("test_body"), case)
 
         try:
             await asyncio.gather(*(exercise(agent, flow) for agent, flow in tasks_for_agents),
-                                 *(read_only(agent, route) for agent, route in read_tasks))
+                                 *(read_only(agent, route) for agent, route in read_tasks),
+                                 *(direct(agent, case) for agent, case in direct_tasks))
         finally:
             await queue.put(None)
             await writer_task

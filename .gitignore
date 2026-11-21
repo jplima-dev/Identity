@@ -1,6 +1,12 @@
 .venv/
 .uv-cache/
+.llm-venv/
+.llm-cache/
+.llm-tools/
+.llm-build/
 __pycache__/
 results/
 yasmin/
 Torneios-api/
+projects/*/runs/
+projects/*/conversas/.llm-training.lock

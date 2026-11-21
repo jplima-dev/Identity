@@ -8,8 +8,12 @@ if (-not (Test-Path -LiteralPath $command -PathType Leaf)) {
 
 $current = [Environment]::GetEnvironmentVariable('Path', 'User')
 $entries = @($current -split ';' | Where-Object { $_ })
-if (-not ($entries | Where-Object { $_.TrimEnd('\') -ieq $scripts.TrimEnd('\') })) {
-    [Environment]::SetEnvironmentVariable('Path', (($entries + $scripts) -join ';'), 'User')
+$entries = @($entries | Where-Object {
+    -not $_.TrimEnd('\').EndsWith('\Identity\.venv\Scripts', [StringComparison]::OrdinalIgnoreCase)
+})
+$updated = ($entries + $scripts) -join ';'
+if ($updated -ne $current.TrimEnd(';')) {
+    [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
 }
 $env:Path = "$env:Path;$scripts"
 Write-Output "Comando instalado: $command"

@@ -88,18 +88,20 @@ def write_training_examples(cases: list[dict[str, str]], output: Path) -> int:
     return len(unique)
 
 
-def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[str, Any] | None, examples: int) -> Path:
+def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[str, Any] | None,
+                       examples: int, llm_rounds: list[dict[str, Any]] | None = None) -> Path:
     by_capability: Counter[str] = Counter()
     unique_questions: set[str] = set()
     by_origin: Counter[str] = Counter()
     lines = [
-        f"# Relatório: {output_dir.name}", "", "## Classificação local de capacidades", "",
+        f"# Relatório: {output_dir.parent.parent.name if output_dir.parent.name == 'runs' else output_dir.name}", "", "## Classificação local de capacidades", "",
         "- Execução: modelo local em memória; nenhum comando enviado à Yasmin ou ao desktop.",
         "- Limite: estes testes avaliam o roteamento da intenção, não a execução nem a resposta das ferramentas.",
         f"- Agentes: {result['agents']}",
         f"- Rodadas executadas: {len(result.get('rounds', []))}",
+        f"- Rodadas configuradas: {result.get('rounds_configured', len(result.get('rounds', [])))}",
         f"- Testes realizados: {result.get('requests', result['agents'])}",
-        f"- Classificações corretas: {result['passed']}",
+        f"- Classificações corretas: {sum(item['passed'] for item in result.get('rounds', [])) if result.get('rounds') else result['passed']}",
         f"- Falhas na última rodada: {result['failed']}",
         f"- Registros: {Path(result['output']).name}", "",
     ]
@@ -129,7 +131,8 @@ def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[
                   "", "### Ferramentas sem exemplos de classificação", "",
                   *(f"- {name}" for name in result.get("uncovered_tools", [])),
                   *(("Nenhuma.",) if not result.get("uncovered_tools") else ()),
-                  "", "## Treino", "", f"- Exemplos de conversa adicionados: {examples}"])
+                  "", "## Treino do classificador de intenções", "",
+                  f"- Exemplos rotulados adicionados: {examples}"])
     if training is not None:
         lines.extend([
             f"- Código de saída do treino: {training['training_exit_code']}",
@@ -137,6 +140,29 @@ def write_agent_report(output_dir: Path, result: dict[str, Any], training: dict[
             "- Testes executáveis do projeto: não iniciados automaticamente.",
             "- Log: treino.log", "", "```text", training["training_log"].strip(), "```", "",
         ])
+    lines.extend(["", "## Treino dos pesos da LLM de conversa", ""])
+    if not llm_rounds:
+        lines.append("- Não configurado nesta execução.")
+    for item in llm_rounds or []:
+        lines.extend([f"### Rodada {item['round']}", "",
+                      f"- Estado: {item['status']}",
+                      f"- Pares revisados novos: {item.get('pairs_added', 0)}",
+                      f"- Pares revisados no arquivo: {item.get('pairs_reviewed', 'não medido')}",
+                      f"- Pares de treino: {item.get('pairs_train', 'não medido')}",
+                      f"- Pares reservados: {item.get('pairs_eval', 'não medido')}",
+                      f"- Passos planejados: {item.get('optimization_steps_target', 'não definido')}",
+                      f"- Passos reais de otimização: {item.get('optimization_steps', 0)}",
+                      f"- Perda anterior: {item.get('loss_before', 'não medida')}",
+                      f"- Perda candidata: {item.get('loss_candidate', 'não medida')}",
+                      f"- Adapter Safetensors: {item.get('adapter') or 'não publicado'}",
+                      f"- Adapter candidato: {item.get('candidate_adapter') or 'não produzido'}",
+                      f"- Modelo publicado: {item.get('model_published') or 'nenhum'}"])
+        if item.get("reason"):
+            lines.append(f"- Motivo: {item['reason']}")
+        for volume in item.get("disk", {}).get("volumes", []):
+            lines.append(f"- Disco {volume['volume']}: {volume['free_bytes']} bytes livres; "
+                         f"{volume['required_bytes']} bytes necessários.")
+        lines.append("")
     report = output_dir / "relatorio-agente.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return report

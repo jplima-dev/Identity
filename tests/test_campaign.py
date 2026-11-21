@@ -14,11 +14,27 @@ from identity.agent_mode import generate_cases, run_agent_cases
 from identity.campaign import next_cases
 from identity.cli import agent_count, round_count, run_mode
 from identity.offline_model import OfflineCapabilityModel
+from identity.saved_projects import load_project, save_project, saved_names
 from identity.scanner import discover_api, discover_base_url
 from identity.train_yasmin import combine_examples
 
 
 class CampaignTests(unittest.TestCase):
+    def test_old_project_scan_remains_available_when_new_layout_is_created(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            identity = project / "Identity"
+            old = identity / project.name / "scan.json"
+            old.parent.mkdir(parents=True)
+            scan = {"project": str(project), "mode": "api"}
+            old.write_text(json.dumps(scan), encoding="utf-8")
+            self.assertIn(project.name, saved_names(identity))
+            self.assertEqual(load_project(identity, project.name), scan)
+            new = save_project(identity, project.name, scan)
+            self.assertEqual(new, identity / "projects" / project.name / "scan.json")
+            self.assertTrue(old.is_file())
+            self.assertEqual(load_project(identity, project.name), scan)
+
     def test_conversation_examples_replace_only_remaining_base_slots(self):
         base = [("a", "nenhuma"), ("b", "nenhuma"), ("c", "preparar_programacao")]
         extras = [("a", "nenhuma"), ("d", "nenhuma")]
@@ -71,7 +87,7 @@ class CampaignTests(unittest.TestCase):
                                         text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(expected, result.stdout)
-            self.assertFalse((identity / project.name).exists())
+            self.assertFalse((identity / "projects" / project.name).exists())
             selected = subprocess.run([sys.executable, "-m", "identity", "plan", "--project", str(project)],
                                       cwd=identity, text=True, capture_output=True, check=False, timeout=15)
             self.assertEqual(selected.returncode, 0, selected.stderr)
@@ -82,7 +98,9 @@ class CampaignTests(unittest.TestCase):
             shown = subprocess.run([sys.executable, "-m", "identity", "report", project.name],
                                    cwd=identity, text=True, capture_output=True, check=False, timeout=15)
             self.assertEqual(shown.returncode, 0, shown.stderr)
-            self.assertIn("Teste local.", shown.stdout)
+            self.assertIn("Relatório antigo; diagnóstico parcial", shown.stdout)
+            self.assertIn("relatorio-api.md", shown.stdout)
+            self.assertNotIn("Teste local.", shown.stdout)
             agent_report = report_dir / "relatorio-agente.md"
             agent_report.write_text("# Relatorio de agente\n\nSegundo relatorio.", encoding="utf-8")
             future = (report_dir / "relatorio-api.md").stat().st_mtime + 10
@@ -91,7 +109,8 @@ class CampaignTests(unittest.TestCase):
                 newest = subprocess.run([sys.executable, "-m", "identity", *arguments], cwd=identity,
                                         text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(newest.returncode, 0, newest.stderr)
-                self.assertIn("Segundo relatorio.", newest.stdout)
+                self.assertIn("relatorio-agente.md", newest.stdout)
+                self.assertNotIn("Segundo relatorio.", newest.stdout)
             for kind, value, expected in (("ag", "7", "7.ag"), ("rod", "9", "9.rod"), ("tes", "agente", "agente.tes")):
                 updated = subprocess.run([sys.executable, "-m", "identity", kind, "set", value], cwd=identity,
                                          text=True, capture_output=True, check=False, timeout=15)
@@ -182,11 +201,12 @@ class CampaignTests(unittest.TestCase):
                                       text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(scan.returncode, 0, scan.stderr + scan.stdout)
                 self.assertIn(f"identity {project.name}", scan.stdout)
-                saved_scan = identity / project.name / "scan.json"
+                project_results = identity / "projects" / project.name
+                saved_scan = project_results / "scan.json"
                 saved_data = json.loads(saved_scan.read_text(encoding="utf-8"))
                 saved_data["mode"] = "agente"
                 saved_scan.write_text(json.dumps(saved_data), encoding="utf-8")
-                self.assertFalse(list((identity / project.name).glob("run-*.jsonl")))
+                self.assertFalse(list((project_results / "runs").glob("*/resultados.jsonl")))
                 self.assertEqual(hits, [])
                 help_result = subprocess.run([sys.executable, "-m", "identity", "--help"], cwd=identity,
                                              text=True, capture_output=True, check=False, timeout=15)
@@ -196,6 +216,9 @@ class CampaignTests(unittest.TestCase):
                                          text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(welcome.returncode, 0, welcome.stderr)
                 self.assertIn("IDENTITY  /  COMANDOS", welcome.stdout)
+                self.assertIn("EXEMPLO  /  API", welcome.stdout)
+                self.assertIn("identity scam --project", welcome.stdout)
+                self.assertIn("identity report minha-api", welcome.stdout)
                 self.assertIn("PROJETOS SALVOS", welcome.stdout)
                 (config / "10.rod").unlink()
                 missing_rounds = subprocess.run([sys.executable, "-m", "identity", project.name], cwd=project,
@@ -211,7 +234,7 @@ class CampaignTests(unittest.TestCase):
                 self.assertIn("RESULTADO  /  API", completed.stdout)
                 self.assertEqual(hits, ["/health"] * 3)
                 self.assertEqual(json.loads(saved_scan.read_text(encoding="utf-8"))["mode"], "api")
-                report = (identity / project.name / "relatorio-api.md").read_text(encoding="utf-8")
+                report = next((project_results / "runs").glob("*/relatorio-api.md")).read_text(encoding="utf-8")
                 self.assertIn("Requisições: 3", report)
                 (config / "3.ag").unlink()
                 (config / "2.ag").touch()
@@ -221,7 +244,15 @@ class CampaignTests(unittest.TestCase):
                                        text=True, capture_output=True, check=False, timeout=15)
                 self.assertEqual(rerun.returncode, 0, rerun.stderr + rerun.stdout)
                 self.assertEqual(hits, ["/health"] * 5)
-                self.assertIn("Requisições: 2", (identity / project.name / "relatorio-api.md").read_text(encoding="utf-8"))
+                newest_report = max((project_results / "runs").glob("*/relatorio-api.md"), key=lambda path: path.stat().st_mtime)
+                self.assertIn("Requisições: 2", newest_report.read_text(encoding="utf-8"))
+                for arguments in (("report", project.name), ("report",)):
+                    shown = subprocess.run([sys.executable, "-m", "identity", *arguments], cwd=identity,
+                                           text=True, capture_output=True, check=False, timeout=15)
+                    self.assertEqual(shown.returncode, 0, shown.stderr)
+                    self.assertIn("Sem falhas detectadas", shown.stdout)
+                    self.assertIn("Relatório completo", shown.stdout)
+                    self.assertNotIn("# Relatório:", shown.stdout)
         finally:
             server.shutdown()
             server.server_close()

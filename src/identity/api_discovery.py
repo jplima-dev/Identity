@@ -201,8 +201,15 @@ def _openapi_routes(project: Path) -> list[dict[str, Any]]:
                 if schema is None:
                     schema = next((item.get("schema") for item in operation.get("parameters", [])
                                    if isinstance(item, dict) and item.get("in") == "body"), None)
+                responses = operation.get("responses", {})
+                statuses = sorted(int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300)
+                response = responses.get(str(statuses[0]), {}) if statuses else {}
+                response_content = response.get("content", {}) if isinstance(response, dict) else {}
+                response_schema = response_content.get("application/json", {}).get("schema")
                 routes.append({"method": method.upper(), "path": path, "source": str(file.relative_to(project)),
-                               "body_schema": resolve(schema) if isinstance(schema, dict) else None})
+                               "body_schema": resolve(schema) if isinstance(schema, dict) else None,
+                               "expected_status": statuses or None,
+                               "response_schema": resolve(response_schema) if isinstance(response_schema, dict) else None})
     return routes
 
 
